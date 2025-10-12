@@ -4,24 +4,30 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
+	"time"
 
 	appInventory "github.com/Zhima-Mochi/minishop-observability/app/internal/application/inventory"
 	appOrder "github.com/Zhima-Mochi/minishop-observability/app/internal/application/order"
 	domainInventory "github.com/Zhima-Mochi/minishop-observability/app/internal/domain/inventory"
 	domainOrder "github.com/Zhima-Mochi/minishop-observability/app/internal/domain/order"
 	domainPayment "github.com/Zhima-Mochi/minishop-observability/app/internal/domain/payment"
+	"github.com/Zhima-Mochi/minishop-observability/app/internal/pkg/logging"
+	"github.com/google/uuid"
 )
 
 type Handler struct {
 	orderService     *appOrder.Service
 	inventoryService *appInventory.Service
+	logger           *slog.Logger
 }
 
-func NewHandler(orderSvc *appOrder.Service, inventorySvc *appInventory.Service) *Handler {
+func NewHandler(orderSvc *appOrder.Service, inventorySvc *appInventory.Service, logger *slog.Logger) *Handler {
 	return &Handler{
 		orderService:     orderSvc,
 		inventoryService: inventorySvc,
+		logger:           logger,
 	}
 }
 
@@ -40,7 +46,7 @@ func (h *Handler) Router() http.Handler {
 		_, _ = w.Write([]byte("ok"))
 	})
 
-	return mux
+	return h.withLogging(mux)
 }
 
 type createOrderRequest struct {
@@ -56,8 +62,10 @@ type createOrderResponse struct {
 }
 
 func (h *Handler) handleCreateOrder(w http.ResponseWriter, r *http.Request) {
+	logger := logging.FromContext(r.Context())
 	var req createOrderRequest
 	if err := decodeJSON(r.Context(), r, &req); err != nil {
+		logger.Warn("bad_request", "path", r.URL.Path, "error", err)
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
@@ -69,6 +77,7 @@ func (h *Handler) handleCreateOrder(w http.ResponseWriter, r *http.Request) {
 		Amount:     req.Amount,
 	})
 	if err != nil {
+		logger.Error("create_order_failed", "error", err)
 		writeDomainError(w, err)
 		return
 	}
@@ -90,14 +99,17 @@ type deductInventoryResponse struct {
 }
 
 func (h *Handler) handleDeductInventory(w http.ResponseWriter, r *http.Request) {
+	logger := logging.FromContext(r.Context())
 	var req deductInventoryRequest
 	if err := decodeJSON(r.Context(), r, &req); err != nil {
+		logger.Warn("bad_request", "path", r.URL.Path, "error", err)
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
 
 	remaining, err := h.inventoryService.Deduct(r.Context(), req.ProductID, req.Quantity)
 	if err != nil {
+		logger.Error("inventory_deduct_failed", "error", err, "product_id", req.ProductID)
 		writeDomainError(w, err)
 		return
 	}
@@ -119,14 +131,17 @@ type processPaymentResponse struct {
 }
 
 func (h *Handler) handleProcessPayment(w http.ResponseWriter, r *http.Request) {
+	logger := logging.FromContext(r.Context())
 	var req processPaymentRequest
 	if err := decodeJSON(r.Context(), r, &req); err != nil {
+		logger.Warn("bad_request", "path", r.URL.Path, "error", err)
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
 
 	status, err := h.orderService.ProcessPayment(r.Context(), req.OrderID, req.Amount)
 	if err != nil {
+		logger.Error("payment_failed", "error", err, "order_id", req.OrderID)
 		writeDomainError(w, err)
 		return
 	}
@@ -145,6 +160,34 @@ func (h *Handler) method(method string, handler http.HandlerFunc) http.HandlerFu
 		}
 		handler(w, r)
 	}
+}
+
+// withLogging adds a simple access log around the handler.
+func (h *Handler) withLogging(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		lrw := &loggingResponseWriter{ResponseWriter: w, status: http.StatusOK}
+		reqID := uuid.NewString()
+		reqLogger := h.logger.With("request_id", reqID)
+		ctx := logging.ContextWithLogger(r.Context(), reqLogger)
+		next.ServeHTTP(lrw, r.WithContext(ctx))
+		reqLogger.Info("http_request",
+			"method", r.Method,
+			"path", r.URL.Path,
+			"status", lrw.status,
+			"duration_ms", time.Since(start).Milliseconds(),
+		)
+	})
+}
+
+type loggingResponseWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func (w *loggingResponseWriter) WriteHeader(statusCode int) {
+	w.status = statusCode
+	w.ResponseWriter.WriteHeader(statusCode)
 }
 
 func decodeJSON(ctx context.Context, r *http.Request, dst any) error {

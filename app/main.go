@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -24,8 +25,12 @@ func main() {
 	paymentService := appPayment.NewService(0.7)
 	idGenerator := id.NewUUIDGenerator()
 
+	// Initialize structured logger
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{}))
+	slog.SetDefault(logger)
+
 	orderService := appOrder.NewService(orderRepo, inventoryService, paymentService, idGenerator)
-	handler := httptransport.NewHandler(orderService, inventoryService)
+	handler := httptransport.NewHandler(orderService, inventoryService, logger.With("component", "http"))
 
 	server := &http.Server{
 		Addr:    ":8080",
@@ -36,9 +41,10 @@ func main() {
 	defer stop()
 
 	go func() {
+		logger.Info("http_server_start", "addr", server.Addr)
 		err := server.ListenAndServe()
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {
-			panic(err)
+			logger.Error("http_server_error", "error", err)
 		}
 	}()
 
@@ -48,6 +54,8 @@ func main() {
 	defer cancel()
 
 	if err := server.Shutdown(shutdownCtx); err != nil {
-		panic(err)
+		logger.Error("http_server_shutdown_error", "error", err)
+	} else {
+		logger.Info("http_server_stopped")
 	}
 }
