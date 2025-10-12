@@ -6,7 +6,6 @@ BASE_URL=${BASE_URL:-http://localhost:8080}
 CONCURRENCY=${CONCURRENCY:-10}
 REQUESTS=${REQUESTS:-100}
 ORDER_PAYLOAD_TEMPLATE=${ORDER_PAYLOAD_TEMPLATE:-}
-INVENTORY_PAYLOAD_TEMPLATE=${INVENTORY_PAYLOAD_TEMPLATE:-}
 PAYMENT_PAYLOAD_TEMPLATE=${PAYMENT_PAYLOAD_TEMPLATE:-}
 
 # Ensure required tools are available
@@ -22,7 +21,7 @@ random_suffix() {
 }
 
 PRODUCT_ID=${PRODUCT_ID:-prod-$(random_suffix)}
-export BASE_URL CONCURRENCY REQUESTS ORDER_PAYLOAD_TEMPLATE INVENTORY_PAYLOAD_TEMPLATE PAYMENT_PAYLOAD_TEMPLATE PRODUCT_ID
+export BASE_URL CONCURRENCY REQUESTS ORDER_PAYLOAD_TEMPLATE PAYMENT_PAYLOAD_TEMPLATE PRODUCT_ID
 
 log() {
   printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*" >&2
@@ -39,19 +38,6 @@ make_order_payload() {
   "product_id": "${PRODUCT_ID}",
   "quantity": 1,
   "amount": 1000
-}
-JSON
-  fi
-}
-
-make_inventory_payload() {
-  if [[ -n "$INVENTORY_PAYLOAD_TEMPLATE" && -f "$INVENTORY_PAYLOAD_TEMPLATE" ]]; then
-    cat "$INVENTORY_PAYLOAD_TEMPLATE"
-  else
-    cat <<JSON
-{
-  "product_id": "${PRODUCT_ID}",
-  "quantity": 1
 }
 JSON
   fi
@@ -101,14 +87,6 @@ worker() {
     fi
     order_id=$(echo "$REPLY_BODY" | jq -r '.order_id // empty')
 
-    local inventory_payload
-    inventory_payload=$(make_inventory_payload)
-    invoke_api POST /inventory/deduct "$inventory_payload"
-    if [[ "${REPLY_STATUS:0:1}" != "2" ]]; then
-      log "Inventory failed (status $REPLY_STATUS)"
-      continue
-    fi
-
     local payment_payload
     payment_payload=$(make_payment_payload "$order_id")
     invoke_api POST /payment/pay "$payment_payload"
@@ -119,6 +97,6 @@ worker() {
   done
 }
 
-export -f worker invoke_api log make_order_payload make_inventory_payload make_payment_payload random_suffix
+export -f worker invoke_api log make_order_payload make_payment_payload random_suffix
 
 seq "$CONCURRENCY" | xargs -I{} -n1 -P"$CONCURRENCY" bash -c worker

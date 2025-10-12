@@ -1,36 +1,35 @@
 package main
 
 import (
-	"context"
-	"errors"
-	"log/slog"
-	"net/http"
-	"os"
+    "context"
+    "errors"
+    "log/slog"
+    "net/http"
+    "os"
 	"os/signal"
 	"syscall"
 	"time"
 
-	appInventory "github.com/Zhima-Mochi/minishop-observability/app/internal/application/inventory"
-	appOrder "github.com/Zhima-Mochi/minishop-observability/app/internal/application/order"
-	appPayment "github.com/Zhima-Mochi/minishop-observability/app/internal/application/payment"
-	httptransport "github.com/Zhima-Mochi/minishop-observability/app/internal/infrastructure/http"
-	"github.com/Zhima-Mochi/minishop-observability/app/internal/infrastructure/id"
-	"github.com/Zhima-Mochi/minishop-observability/app/internal/infrastructure/memory"
+    appOrder "github.com/Zhima-Mochi/minishop-observability/app/internal/application/order"
+    appPayment "github.com/Zhima-Mochi/minishop-observability/app/internal/application/payment"
+    httptransport "github.com/Zhima-Mochi/minishop-observability/app/internal/infrastructure/http"
+    "github.com/Zhima-Mochi/minishop-observability/app/internal/infrastructure/id"
+    "github.com/Zhima-Mochi/minishop-observability/app/internal/infrastructure/memory"
 )
 
 func main() {
-	orderRepo := memory.NewOrderRepository()
-	inventoryRepo := memory.NewInventoryRepository()
-	inventoryService := appInventory.NewService(inventoryRepo, 100)
-	paymentService := appPayment.NewService(0.7)
-	idGenerator := id.NewUUIDGenerator()
+    orderRepo := memory.NewOrderRepository()
+    inventoryRepo := memory.NewInventoryRepository()
+    paymentService := appPayment.NewService(orderRepo, 0.7)
+    idGenerator := id.NewUUIDGenerator()
 
 	// Initialize structured logger
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{}))
 	slog.SetDefault(logger)
 
-	orderService := appOrder.NewService(orderRepo, inventoryService, paymentService, idGenerator)
-	handler := httptransport.NewHandler(orderService, inventoryService, logger.With("component", "http"))
+    // Wire order service to use inventory repo directly (no payment here)
+    orderService := appOrder.NewService(orderRepo, inventoryRepo, idGenerator, 100)
+    handler := httptransport.NewHandler(orderService, paymentService, logger.With("component", "http"))
 
 	server := &http.Server{
 		Addr:    ":8080",

@@ -1,7 +1,6 @@
 package inventory
 
 import (
-	"context"
 	"errors"
 	"time"
 )
@@ -43,9 +42,4 @@ func (i *Item) Deduct(quantity int) error {
 
 func (i *Item) touch() {
 	i.UpdatedAt = time.Now().UTC()
-}
-
-type Repository interface {
-	Get(ctx context.Context, productID string) (*Item, error)
-	Save(ctx context.Context, item *Item) error
 }

@@ -11,7 +11,6 @@ You’ll build a small system with full visibility into its behavior using Prome
 Build a mini e-commerce backend with three simple APIs:
 
 * `POST /order` — Create an order (returns `order_id`)
-* `POST /inventory/deduct` — Deduct inventory for a product
 * `POST /payment/pay` — Simulate payment (random success/failure)
 
 The goal isn’t business logic — it’s **observability completeness**.
@@ -23,7 +22,6 @@ The goal isn’t business logic — it’s **observability completeness**.
 | API                      | Function         | Description                                       |
 | ------------------------ | ---------------- | ------------------------------------------------- |
 | `POST /order`            | Create Order     | Simulate creating an order and return an order ID |
-| `POST /inventory/deduct` | Deduct Inventory | Receive product ID and quantity to deduct         |
 | `POST /payment/pay`      | Payment          | Simulate payment success or failure (randomized)  |
 
 ---
@@ -57,11 +55,10 @@ The goal isn’t business logic — it’s **observability completeness**.
 ### **3. Traces**
 
 * Use **OpenTelemetry + Jaeger**.
-* Each `POST /order` should produce a trace with three spans:
+* Each `POST /order` should produce a trace with two spans:
 
   * `CreateOrder`
   * `DeductInventory`
-  * `PayOrder`
 * Jaeger should display the full trace and latency breakdown.
 
 ### **4. Bonus Challenge**

@@ -1,29 +1,29 @@
 package order
 
 import (
-	"context"
-	"errors"
-	"fmt"
+    "context"
+    "errors"
+    "fmt"
 
-	domain "github.com/Zhima-Mochi/minishop-observability/app/internal/domain/order"
-	domainPayment "github.com/Zhima-Mochi/minishop-observability/app/internal/domain/payment"
-	"github.com/Zhima-Mochi/minishop-observability/app/internal/pkg/logging"
+    dominv "github.com/Zhima-Mochi/minishop-observability/app/internal/domain/inventory"
+    domain "github.com/Zhima-Mochi/minishop-observability/app/internal/domain/order"
+    "github.com/Zhima-Mochi/minishop-observability/app/internal/pkg/logging"
 )
 
 type Service struct {
-	repo        domain.Repository
-	inventory   InventoryPort
-	payment     PaymentPort
-	idGenerator IDGenerator
+    repo         domain.Repository
+    invRepo      dominv.Repository
+    initialStock int
+    idGenerator  IDGenerator
 }
 
-func NewService(repo domain.Repository, inventory InventoryPort, payment PaymentPort, idGen IDGenerator) *Service {
-	return &Service{
-		repo:        repo,
-		inventory:   inventory,
-		payment:     payment,
-		idGenerator: idGen,
-	}
+func NewService(repo domain.Repository, invRepo dominv.Repository, idGen IDGenerator, initialStock int) *Service {
+    return &Service{
+        repo:         repo,
+        invRepo:      invRepo,
+        initialStock: initialStock,
+        idGenerator:  idGen,
+    }
 }
 
 type CreateOrderInput struct {
@@ -60,22 +60,44 @@ func (s *Service) CreateOrder(ctx context.Context, input CreateOrderInput) (*Cre
 		return nil, fmt.Errorf("order: save: %w", err)
 	}
 
-	if _, err := s.inventory.Deduct(ctx, entity.ProductID, entity.Quantity); err != nil {
+	// Inventory deduction is done directly via repository (no application layer)
+	if _, err := s.deductInventory(ctx, entity.ProductID, entity.Quantity); err != nil {
 		logger.Error("inventory_deduct_failed", "order_id", entity.ID, "product_id", entity.ProductID, "error", err)
 		return nil, fmt.Errorf("order: inventory deduction failed: %w", err)
 	}
 
-	_, err = s.executePayment(ctx, entity)
-	if err != nil {
-		logger.Error("order_payment_failed", "order_id", entity.ID, "error", err)
-		return nil, err
+    logger.Info("create_order_success", "order_id", entity.ID, "status", entity.Status)
+    return &CreateOrderResult{
+        OrderID: entity.ID,
+        Status:  entity.Status,
+    }, nil
+}
+
+// deductInventory loads or initializes inventory for the product and deducts quantity.
+func (s *Service) deductInventory(ctx context.Context, productID string, quantity int) (int, error) {
+	if productID == "" {
+		return 0, errors.New("inventory: product id is required")
 	}
 
-	logger.Info("create_order_success", "order_id", entity.ID, "status", entity.Status)
-	return &CreateOrderResult{
-		OrderID: entity.ID,
-		Status:  entity.Status,
-	}, nil
+	item, err := s.invRepo.Get(ctx, productID)
+	if errors.Is(err, dominv.ErrNotFound) {
+		item, err = dominv.NewItem(productID, s.initialStock)
+		if err != nil {
+			return 0, err
+		}
+	} else if err != nil {
+		return 0, err
+	}
+
+	if err := item.Deduct(quantity); err != nil {
+		return 0, err
+	}
+
+	if err := s.invRepo.Save(ctx, item); err != nil {
+		return 0, err
+	}
+
+	return item.Quantity, nil
 }
 
 func (s *Service) Get(ctx context.Context, id string) (*domain.Order, error) {
@@ -89,40 +111,4 @@ func (s *Service) Get(ctx context.Context, id string) (*domain.Order, error) {
 	return order, nil
 }
 
-func (s *Service) ProcessPayment(ctx context.Context, id string, amount int64) (domainPayment.Status, error) {
-	logger := logging.FromContext(ctx).With("component", "order_service")
-	logger.Info("process_payment_start", "order_id", id, "amount", amount)
-	order, err := s.repo.FindByID(ctx, id)
-	if err != nil {
-		return domainPayment.StatusFailed, err
-	}
-	if amount > 0 {
-		order.Amount = amount
-	}
-	return s.executePayment(ctx, order)
-}
-
-func (s *Service) executePayment(ctx context.Context, entity *domain.Order) (domainPayment.Status, error) {
-	logger := logging.FromContext(ctx).With("component", "order_service")
-	status, err := s.payment.Pay(ctx, entity.ID, entity.Amount)
-	if err != nil {
-		logger.Error("payment_error", "order_id", entity.ID, "error", err)
-		return domainPayment.StatusFailed, fmt.Errorf("order: payment failed: %w", err)
-	}
-
-	switch status {
-	case domainPayment.StatusSuccess:
-		entity.MarkCompleted()
-		logger.Info("payment_success", "order_id", entity.ID)
-	default:
-		entity.MarkPaymentFailed()
-		logger.Info("payment_failed", "order_id", entity.ID)
-	}
-
-	if err := s.repo.Update(ctx, entity); err != nil {
-		logger.Error("order_update_failed", "order_id", entity.ID, "error", err)
-		return domainPayment.StatusFailed, fmt.Errorf("order: update: %w", err)
-	}
-
-	return status, nil
-}
+// Payment is handled by the payment service; order service does not process payments.

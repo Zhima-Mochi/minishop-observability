@@ -1,50 +1,49 @@
 package httptransport
 
 import (
-	"context"
-	"encoding/json"
-	"errors"
-	"log/slog"
-	"net/http"
-	"time"
+    "context"
+    "encoding/json"
+    "errors"
+    "log/slog"
+    "net/http"
+    "time"
 
-	appInventory "github.com/Zhima-Mochi/minishop-observability/app/internal/application/inventory"
-	appOrder "github.com/Zhima-Mochi/minishop-observability/app/internal/application/order"
-	domainInventory "github.com/Zhima-Mochi/minishop-observability/app/internal/domain/inventory"
-	domainOrder "github.com/Zhima-Mochi/minishop-observability/app/internal/domain/order"
-	domainPayment "github.com/Zhima-Mochi/minishop-observability/app/internal/domain/payment"
-	"github.com/Zhima-Mochi/minishop-observability/app/internal/pkg/logging"
-	"github.com/google/uuid"
+    appOrder "github.com/Zhima-Mochi/minishop-observability/app/internal/application/order"
+    appPayment "github.com/Zhima-Mochi/minishop-observability/app/internal/application/payment"
+    domainInventory "github.com/Zhima-Mochi/minishop-observability/app/internal/domain/inventory"
+    domainOrder "github.com/Zhima-Mochi/minishop-observability/app/internal/domain/order"
+    domainPayment "github.com/Zhima-Mochi/minishop-observability/app/internal/domain/payment"
+    "github.com/Zhima-Mochi/minishop-observability/app/internal/pkg/logging"
+    "github.com/google/uuid"
 )
 
 type Handler struct {
-	orderService     *appOrder.Service
-	inventoryService *appInventory.Service
-	logger           *slog.Logger
+    orderService     *appOrder.Service
+    paymentService   *appPayment.Service
+    logger           *slog.Logger
 }
 
-func NewHandler(orderSvc *appOrder.Service, inventorySvc *appInventory.Service, logger *slog.Logger) *Handler {
-	return &Handler{
-		orderService:     orderSvc,
-		inventoryService: inventorySvc,
-		logger:           logger,
-	}
+func NewHandler(orderSvc *appOrder.Service, paymentSvc *appPayment.Service, logger *slog.Logger) *Handler {
+    return &Handler{
+        orderService:     orderSvc,
+        paymentService:   paymentSvc,
+        logger:           logger,
+    }
 }
 
 func (h *Handler) Router() http.Handler {
 	mux := http.NewServeMux()
 
-	mux.HandleFunc("/order", h.method(http.MethodPost, h.handleCreateOrder))
-	mux.HandleFunc("/inventory/deduct", h.method(http.MethodPost, h.handleDeductInventory))
-	mux.HandleFunc("/payment/pay", h.method(http.MethodPost, h.handleProcessPayment))
-	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
-			return
-		}
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("ok"))
-	})
+    mux.HandleFunc("/order", h.method(http.MethodPost, h.handleCreateOrder))
+    mux.HandleFunc("/payment/pay", h.method(http.MethodPost, h.handleProcessPayment))
+    mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+        if r.Method != http.MethodGet {
+            writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
+            return
+        }
+        w.WriteHeader(http.StatusOK)
+        _, _ = w.Write([]byte("ok"))
+    })
 
 	return h.withLogging(mux)
 }
@@ -57,8 +56,8 @@ type createOrderRequest struct {
 }
 
 type createOrderResponse struct {
-	OrderID string             `json:"order_id"`
-	Status  domainOrder.Status `json:"status"`
+    OrderID string             `json:"order_id"`
+    Status  domainOrder.Status `json:"status"`
 }
 
 func (h *Handler) handleCreateOrder(w http.ResponseWriter, r *http.Request) {
@@ -82,42 +81,10 @@ func (h *Handler) handleCreateOrder(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, http.StatusCreated, createOrderResponse{
-		OrderID: result.OrderID,
-		Status:  result.Status,
-	})
-}
-
-type deductInventoryRequest struct {
-	ProductID string `json:"product_id"`
-	Quantity  int    `json:"quantity"`
-}
-
-type deductInventoryResponse struct {
-	ProductID string `json:"product_id"`
-	Remaining int    `json:"remaining"`
-}
-
-func (h *Handler) handleDeductInventory(w http.ResponseWriter, r *http.Request) {
-	logger := logging.FromContext(r.Context())
-	var req deductInventoryRequest
-	if err := decodeJSON(r.Context(), r, &req); err != nil {
-		logger.Warn("bad_request", "path", r.URL.Path, "error", err)
-		writeError(w, http.StatusBadRequest, err)
-		return
-	}
-
-	remaining, err := h.inventoryService.Deduct(r.Context(), req.ProductID, req.Quantity)
-	if err != nil {
-		logger.Error("inventory_deduct_failed", "error", err, "product_id", req.ProductID)
-		writeDomainError(w, err)
-		return
-	}
-
-	writeJSON(w, http.StatusOK, deductInventoryResponse{
-		ProductID: req.ProductID,
-		Remaining: remaining,
-	})
+    writeJSON(w, http.StatusCreated, createOrderResponse{
+        OrderID: result.OrderID,
+        Status:  result.Status,
+    })
 }
 
 type processPaymentRequest struct {
@@ -131,20 +98,20 @@ type processPaymentResponse struct {
 }
 
 func (h *Handler) handleProcessPayment(w http.ResponseWriter, r *http.Request) {
-	logger := logging.FromContext(r.Context())
-	var req processPaymentRequest
-	if err := decodeJSON(r.Context(), r, &req); err != nil {
-		logger.Warn("bad_request", "path", r.URL.Path, "error", err)
-		writeError(w, http.StatusBadRequest, err)
-		return
-	}
+    logger := logging.FromContext(r.Context())
+    var req processPaymentRequest
+    if err := decodeJSON(r.Context(), r, &req); err != nil {
+        logger.Warn("bad_request", "path", r.URL.Path, "error", err)
+        writeError(w, http.StatusBadRequest, err)
+        return
+    }
 
-	status, err := h.orderService.ProcessPayment(r.Context(), req.OrderID, req.Amount)
-	if err != nil {
-		logger.Error("payment_failed", "error", err, "order_id", req.OrderID)
-		writeDomainError(w, err)
-		return
-	}
+    status, err := h.paymentService.ProcessPayment(r.Context(), req.OrderID, req.Amount)
+    if err != nil {
+        logger.Error("payment_failed", "error", err, "order_id", req.OrderID)
+        writeDomainError(w, err)
+        return
+    }
 
 	writeJSON(w, http.StatusOK, processPaymentResponse{
 		OrderID: req.OrderID,
