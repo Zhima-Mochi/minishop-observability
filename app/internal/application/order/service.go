@@ -1,29 +1,27 @@
 package order
 
 import (
-    "context"
-    "errors"
-    "fmt"
+	"context"
+	"errors"
+	"fmt"
 
-    dominv "github.com/Zhima-Mochi/minishop-observability/app/internal/domain/inventory"
-    domain "github.com/Zhima-Mochi/minishop-observability/app/internal/domain/order"
-    "github.com/Zhima-Mochi/minishop-observability/app/internal/pkg/logging"
+	dominv "github.com/Zhima-Mochi/minishop-observability/app/internal/domain/inventory"
+	domain "github.com/Zhima-Mochi/minishop-observability/app/internal/domain/order"
+	"github.com/Zhima-Mochi/minishop-observability/app/internal/pkg/logging"
 )
 
 type Service struct {
-    repo         domain.Repository
-    invRepo      dominv.Repository
-    initialStock int
-    idGenerator  IDGenerator
+	repo        domain.Repository
+	invRepo     dominv.Repository
+	idGenerator IDGenerator
 }
 
-func NewService(repo domain.Repository, invRepo dominv.Repository, idGen IDGenerator, initialStock int) *Service {
-    return &Service{
-        repo:         repo,
-        invRepo:      invRepo,
-        initialStock: initialStock,
-        idGenerator:  idGen,
-    }
+func NewService(repo domain.Repository, invRepo dominv.Repository, idGen IDGenerator) *Service {
+	return &Service{
+		repo:        repo,
+		invRepo:     invRepo,
+		idGenerator: idGen,
+	}
 }
 
 type CreateOrderInput struct {
@@ -66,11 +64,11 @@ func (s *Service) CreateOrder(ctx context.Context, input CreateOrderInput) (*Cre
 		return nil, fmt.Errorf("order: inventory deduction failed: %w", err)
 	}
 
-    logger.Info("create_order_success", "order_id", entity.ID, "status", entity.Status)
-    return &CreateOrderResult{
-        OrderID: entity.ID,
-        Status:  entity.Status,
-    }, nil
+	logger.Info("create_order_success", "order_id", entity.ID, "status", entity.Status)
+	return &CreateOrderResult{
+		OrderID: entity.ID,
+		Status:  entity.Status,
+	}, nil
 }
 
 // deductInventory loads or initializes inventory for the product and deducts quantity.
@@ -80,12 +78,7 @@ func (s *Service) deductInventory(ctx context.Context, productID string, quantit
 	}
 
 	item, err := s.invRepo.Get(ctx, productID)
-	if errors.Is(err, dominv.ErrNotFound) {
-		item, err = dominv.NewItem(productID, s.initialStock)
-		if err != nil {
-			return 0, err
-		}
-	} else if err != nil {
+	if err != nil {
 		return 0, err
 	}
 

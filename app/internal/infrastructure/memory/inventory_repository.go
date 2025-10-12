@@ -24,12 +24,14 @@ func (r *InventoryRepository) Get(ctx context.Context, productID string) (*domai
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
-	item, ok := r.items[productID]
-	if !ok {
-		return nil, domain.ErrNotFound
+	if _, ok := r.items[productID]; !ok {
+		r.items[productID] = &domain.Item{
+			ProductID: productID,
+			Quantity:  1,
+		}
 	}
 
-	return cloneItem(item), nil
+	return cloneItem(r.items[productID]), nil
 }
 
 func (r *InventoryRepository) Save(ctx context.Context, item *domain.Item) error {
