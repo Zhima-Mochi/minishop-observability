@@ -1,96 +1,105 @@
 package payment
 
 import (
-    "context"
-    "errors"
-    "math/rand"
-    "sync"
-    "time"
+	"context"
+	"errors"
+	"math/rand"
+	"sync"
+	"time"
 
-    pstat "github.com/Zhima-Mochi/minishop-observability/app/internal/domain/payment"
-    domorder "github.com/Zhima-Mochi/minishop-observability/app/internal/domain/order"
-    "github.com/Zhima-Mochi/minishop-observability/app/internal/pkg/logging"
+	domorder "github.com/Zhima-Mochi/minishop-observability/app/internal/domain/order"
+	pstat "github.com/Zhima-Mochi/minishop-observability/app/internal/domain/payment"
+	"github.com/Zhima-Mochi/minishop-observability/app/internal/pkg/logging"
 )
 
 type Service struct {
-    mu          sync.Mutex
-    random      *rand.Rand
-    successRate float64
-    orderRepo   domorder.Repository
+	mu          sync.Mutex
+	random      *rand.Rand
+	successRate float64
+	orderRepo   domorder.Repository
 }
 
 func NewService(orderRepo domorder.Repository, successRate float64) *Service {
-    if successRate <= 0 || successRate > 1 {
-        successRate = 0.7
-    }
-    return &Service{
-        random:      rand.New(rand.NewSource(time.Now().UnixNano())),
-        successRate: successRate,
-        orderRepo:   orderRepo,
-    }
+	if successRate <= 0 || successRate > 1 {
+		successRate = 0.7
+	}
+	return &Service{
+		random:      rand.New(rand.NewSource(time.Now().UnixNano())),
+		successRate: successRate,
+		orderRepo:   orderRepo,
+	}
 }
 
 // ProcessPayment checks order existence and status, then simulates payment and updates order state.
 func (s *Service) ProcessPayment(ctx context.Context, orderID string, amount int64) (pstat.Status, error) {
-    logger := logging.FromContext(ctx).With("component", "payment_service")
-    logger.Info("process_payment_start", "order_id", orderID, "amount", amount)
+	logger := logging.FromContext(ctx).With("component", "payment_service")
+	logger.Info("process_payment_start", "order_id", orderID, "amount", amount)
 
-    if orderID == "" {
-        return pstat.StatusFailed, errors.New("payment: order id is required")
-    }
-    if amount < 0 {
-        return pstat.StatusFailed, errors.New("payment: amount must be zero or greater")
-    }
+	if orderID == "" {
+		return pstat.StatusFailed, errors.New("payment: order id is required")
+	}
+	if amount < 0 {
+		return pstat.StatusFailed, errors.New("payment: amount must be zero or greater")
+	}
 
-    order, err := s.orderRepo.FindByID(ctx, orderID)
-    if err != nil {
-        return pstat.StatusFailed, err
-    }
-    if order.Status == domorder.StatusCompleted {
-        return pstat.StatusFailed, errors.New("payment: order already paid")
-    }
-    if amount > 0 {
-        order.Amount = amount
-    }
+	order, err := s.orderRepo.FindByID(ctx, orderID)
+	if err != nil {
+		return pstat.StatusFailed, err
+	}
+	if order.Status == domorder.StatusCompleted {
+		return pstat.StatusFailed, errors.New("payment: order already paid")
+	}
+	if !order.CanProcessPayment() {
+		return pstat.StatusFailed, errors.New("payment: order not ready for payment")
+	}
+	if amount > 0 {
+		order.Amount = amount
+	}
 
-    status, err := s.pay(ctx, order.ID, order.Amount)
-    if err != nil {
-        logger.Error("payment_error", "order_id", order.ID, "error", err)
-        return pstat.StatusFailed, err
-    }
+	status, err := s.pay(ctx, order.ID, order.Amount)
+	if err != nil {
+		logger.Error("payment_error", "order_id", order.ID, "error", err)
+		return pstat.StatusFailed, err
+	}
 
-    switch status {
-    case pstat.StatusSuccess:
-        order.MarkCompleted()
-        logger.Info("payment_success", "order_id", order.ID)
-    default:
-        order.MarkPaymentFailed()
-        logger.Info("payment_failed", "order_id", order.ID)
-    }
+	switch status {
+	case pstat.StatusSuccess:
+		if err := order.PaymentSucceeded(); err != nil {
+			logger.Error("payment_state_transition_failed", "order_id", order.ID, "error", err)
+			return pstat.StatusFailed, err
+		}
+		logger.Info("payment_success", "order_id", order.ID)
+	default:
+		if err := order.PaymentFailed("payment_declined"); err != nil {
+			logger.Error("payment_state_transition_failed", "order_id", order.ID, "error", err)
+			return pstat.StatusFailed, err
+		}
+		logger.Info("payment_failed", "order_id", order.ID)
+	}
 
-    if err := s.orderRepo.Update(ctx, order); err != nil {
-        logger.Error("order_update_failed", "order_id", order.ID, "error", err)
-        return pstat.StatusFailed, err
-    }
+	if err := s.orderRepo.Update(ctx, order); err != nil {
+		logger.Error("order_update_failed", "order_id", order.ID, "error", err)
+		return pstat.StatusFailed, err
+	}
 
-    return status, nil
+	return status, nil
 }
 
 // pay simulates the payment result.
 func (s *Service) pay(ctx context.Context, orderID string, amount int64) (pstat.Status, error) {
-    if orderID == "" {
-        return pstat.StatusFailed, errors.New("payment: order id is required")
-    }
-    if amount < 0 {
-        return pstat.StatusFailed, errors.New("payment: amount must be zero or greater")
-    }
-    _ = ctx
-    s.mu.Lock()
-    defer s.mu.Unlock()
-    if s.random.Float64() <= s.successRate {
-        return pstat.StatusSuccess, nil
-    }
-    return pstat.StatusFailed, nil
+	if orderID == "" {
+		return pstat.StatusFailed, errors.New("payment: order id is required")
+	}
+	if amount < 0 {
+		return pstat.StatusFailed, errors.New("payment: amount must be zero or greater")
+	}
+	_ = ctx
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.random.Float64() <= s.successRate {
+		return pstat.StatusSuccess, nil
+	}
+	return pstat.StatusFailed, nil
 }
 
 func (s *Service) SuccessRate() float64 { return s.successRate }

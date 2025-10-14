@@ -5,22 +5,22 @@ import (
 	"errors"
 	"fmt"
 
-	dominv "github.com/Zhima-Mochi/minishop-observability/app/internal/domain/inventory"
 	domain "github.com/Zhima-Mochi/minishop-observability/app/internal/domain/order"
+	"github.com/Zhima-Mochi/minishop-observability/app/internal/infrastructure/outbox"
 	"github.com/Zhima-Mochi/minishop-observability/app/internal/pkg/logging"
 )
 
 type Service struct {
 	repo        domain.Repository
-	invRepo     dominv.Repository
 	idGenerator IDGenerator
+	publisher   outbox.Publisher
 }
 
-func NewService(repo domain.Repository, invRepo dominv.Repository, idGen IDGenerator) *Service {
+func NewService(repo domain.Repository, idGen IDGenerator, publisher outbox.Publisher) *Service {
 	return &Service{
 		repo:        repo,
-		invRepo:     invRepo,
 		idGenerator: idGen,
+		publisher:   publisher,
 	}
 }
 
@@ -58,10 +58,13 @@ func (s *Service) CreateOrder(ctx context.Context, input CreateOrderInput) (*Cre
 		return nil, fmt.Errorf("order: save: %w", err)
 	}
 
-	// Inventory deduction is done directly via repository (no application layer)
-	if _, err := s.deductInventory(ctx, entity.ProductID, entity.Quantity); err != nil {
-		logger.Error("inventory_deduct_failed", "order_id", entity.ID, "product_id", entity.ProductID, "error", err)
-		return nil, fmt.Errorf("order: inventory deduction failed: %w", err)
+	// Publish domain event for inventory to handle asynchronously (Outbox/Event Bus)
+	if s.publisher != nil {
+		evt := domain.NewOrderCreatedEvent(entity)
+		if err := s.publisher.Publish(ctx, evt); err != nil {
+			logger.Warn("event_publish_failed", "order_id", entity.ID, "event", evt.EventName(), "error", err)
+			// Do not fail order creation due to downstream context failure
+		}
 	}
 
 	logger.Info("create_order_success", "order_id", entity.ID, "status", entity.Status)
@@ -69,28 +72,6 @@ func (s *Service) CreateOrder(ctx context.Context, input CreateOrderInput) (*Cre
 		OrderID: entity.ID,
 		Status:  entity.Status,
 	}, nil
-}
-
-// deductInventory loads or initializes inventory for the product and deducts quantity.
-func (s *Service) deductInventory(ctx context.Context, productID string, quantity int) (int, error) {
-	if productID == "" {
-		return 0, errors.New("inventory: product id is required")
-	}
-
-	item, err := s.invRepo.Get(ctx, productID)
-	if err != nil {
-		return 0, err
-	}
-
-	if err := item.Deduct(quantity); err != nil {
-		return 0, err
-	}
-
-	if err := s.invRepo.Save(ctx, item); err != nil {
-		return 0, err
-	}
-
-	return item.Quantity, nil
 }
 
 func (s *Service) Get(ctx context.Context, id string) (*domain.Order, error) {

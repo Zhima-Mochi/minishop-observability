@@ -71,6 +71,5 @@ func cloneOrder(order *domain.Order) *domain.Order {
 	if order == nil {
 		return nil
 	}
-	clone := *order
-	return &clone
+	return order.Clone()
 }

@@ -10,11 +10,16 @@ import (
 	"syscall"
 	"time"
 
+	appInventory "github.com/Zhima-Mochi/minishop-observability/app/internal/application/inventory"
 	appOrder "github.com/Zhima-Mochi/minishop-observability/app/internal/application/order"
 	appPayment "github.com/Zhima-Mochi/minishop-observability/app/internal/application/payment"
 	httptransport "github.com/Zhima-Mochi/minishop-observability/app/internal/infrastructure/http"
 	"github.com/Zhima-Mochi/minishop-observability/app/internal/infrastructure/id"
+	inventoryworker "github.com/Zhima-Mochi/minishop-observability/app/internal/infrastructure/inventory/worker"
 	"github.com/Zhima-Mochi/minishop-observability/app/internal/infrastructure/memory"
+	orderworker "github.com/Zhima-Mochi/minishop-observability/app/internal/infrastructure/order/worker"
+	"github.com/Zhima-Mochi/minishop-observability/app/internal/infrastructure/outbox"
+	paymentworker "github.com/Zhima-Mochi/minishop-observability/app/internal/infrastructure/payment/worker"
 )
 
 func main() {
@@ -27,8 +32,22 @@ func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{}))
 	slog.SetDefault(logger)
 
-	// Wire order service to use inventory repo directly (no payment here)
-	orderService := appOrder.NewService(orderRepo, inventoryRepo, idGenerator)
+	// In-memory event bus (acts as outbox/event publisher for demo)
+	bus := outbox.NewBus(logger.With("component", "outbox"))
+	bus.Start(context.Background())
+	defer bus.Stop(context.Background())
+
+	// Order service publishes events instead of mutating other contexts directly
+	orderService := appOrder.NewService(orderRepo, idGenerator, bus)
+
+	inventoryService := appInventory.NewService(inventoryRepo, bus)
+	inventoryWorker := inventoryworker.New(bus, inventoryService)
+	orderWorker := orderworker.New(orderRepo, bus, bus, logger.With("component", "order_worker"))
+	paymentWorker := paymentworker.New(bus, paymentService)
+
+	inventoryWorker.Start()
+	orderWorker.Start()
+	paymentWorker.Start()
 	handler := httptransport.NewHandler(orderService, paymentService, logger.With("component", "http"))
 
 	server := &http.Server{
