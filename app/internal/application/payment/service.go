@@ -19,13 +19,10 @@ type Service struct {
 	orderRepo   domorder.Repository
 }
 
-func NewService(orderRepo domorder.Repository, successRate float64) *Service {
-	if successRate <= 0 || successRate > 1 {
-		successRate = 0.7
-	}
+func NewService(orderRepo domorder.Repository) *Service {
 	return &Service{
 		random:      rand.New(rand.NewSource(time.Now().UnixNano())),
-		successRate: successRate,
+		successRate: 0.7,
 		orderRepo:   orderRepo,
 	}
 }
@@ -42,7 +39,7 @@ func (s *Service) ProcessPayment(ctx context.Context, orderID string, amount int
 		return pstat.StatusFailed, errors.New("payment: amount must be zero or greater")
 	}
 
-	order, err := s.orderRepo.FindByID(ctx, orderID)
+	order, err := s.orderRepo.Get(ctx, orderID)
 	if err != nil {
 		return pstat.StatusFailed, err
 	}

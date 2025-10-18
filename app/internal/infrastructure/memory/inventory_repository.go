@@ -3,12 +3,13 @@ package memory
 import (
 	"context"
 	"sync"
+	"time"
 
 	domain "github.com/Zhima-Mochi/minishop-observability/app/internal/domain/inventory"
 )
 
 type InventoryRepository struct {
-	mu    sync.RWMutex
+	mu    sync.Mutex
 	items map[string]*domain.Item
 }
 
@@ -18,39 +19,39 @@ func NewInventoryRepository() *InventoryRepository {
 	}
 }
 
-func (r *InventoryRepository) Get(ctx context.Context, productID string) (*domain.Item, error) {
+func (r *InventoryRepository) Reserve(ctx context.Context, productID string, quantity int) error {
 	_ = ctx
 
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-
-	if _, ok := r.items[productID]; !ok {
-		r.items[productID] = &domain.Item{
-			ProductID: productID,
-			Quantity:  1,
-		}
+	if productID == "" {
+		return domain.ErrNotFound
 	}
-
-	return cloneItem(r.items[productID]), nil
-}
-
-func (r *InventoryRepository) Save(ctx context.Context, item *domain.Item) error {
-	_ = ctx
-	if item == nil {
-		return nil
+	if quantity <= 0 {
+		return domain.ErrInvalidQuantity
 	}
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	r.items[item.ProductID] = cloneItem(item)
+	item, ok := r.items[productID]
+	if !ok {
+		return domain.ErrNotFound
+	}
+	if quantity > item.Quantity {
+		return domain.ErrInsufficientStock
+	}
+
+	item.Quantity -= quantity
+	item.UpdatedAt = time.Now().UTC()
 	return nil
 }
 
-func cloneItem(item *domain.Item) *domain.Item {
-	if item == nil {
-		return nil
+// Seed allows tests or bootstrap code to populate inventory quantities directly.
+func (r *InventoryRepository) Seed(productID string, quantity int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.items[productID] = &domain.Item{
+		ProductID: productID,
+		Quantity:  quantity,
+		UpdatedAt: time.Now().UTC(),
 	}
-	clone := *item
-	return &clone
 }

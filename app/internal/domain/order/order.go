@@ -10,6 +10,7 @@ var (
 	ErrInvalidQuantity        = errors.New("order: quantity must be greater than zero")
 	ErrInvalidAmount          = errors.New("order: amount must be zero or greater")
 	ErrInvalidStateTransition = errors.New("order: invalid state transition")
+	ErrInvalidStatus          = errors.New("order: invalid status")
 )
 
 type Status string

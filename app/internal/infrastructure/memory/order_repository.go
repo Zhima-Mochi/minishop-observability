@@ -19,10 +19,10 @@ func NewOrderRepository() *OrderRepository {
 	}
 }
 
-func (r *OrderRepository) Save(ctx context.Context, order *domain.Order) error {
+func (r *OrderRepository) Insert(ctx context.Context, order *domain.Order) error {
 	_ = ctx
-	if order == nil {
-		return fmt.Errorf("order repository: order is nil")
+	if order == nil || order.ID == "" {
+		return fmt.Errorf("order repository: id is required")
 	}
 
 	r.mu.Lock()
@@ -36,7 +36,7 @@ func (r *OrderRepository) Save(ctx context.Context, order *domain.Order) error {
 	return nil
 }
 
-func (r *OrderRepository) FindByID(ctx context.Context, id string) (*domain.Order, error) {
+func (r *OrderRepository) Get(ctx context.Context, id string) (*domain.Order, error) {
 	_ = ctx
 
 	r.mu.RLock()
@@ -52,8 +52,8 @@ func (r *OrderRepository) FindByID(ctx context.Context, id string) (*domain.Orde
 
 func (r *OrderRepository) Update(ctx context.Context, order *domain.Order) error {
 	_ = ctx
-	if order == nil {
-		return fmt.Errorf("order repository: order is nil")
+	if order == nil || order.ID == "" {
+		return fmt.Errorf("order repository: id is required")
 	}
 
 	r.mu.Lock()
@@ -71,5 +71,6 @@ func cloneOrder(order *domain.Order) *domain.Order {
 	if order == nil {
 		return nil
 	}
-	return order.Clone()
+	clone := order.Clone()
+	return clone
 }

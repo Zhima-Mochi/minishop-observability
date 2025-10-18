@@ -25,7 +25,7 @@ import (
 func main() {
 	orderRepo := memory.NewOrderRepository()
 	inventoryRepo := memory.NewInventoryRepository()
-	paymentService := appPayment.NewService(orderRepo, 0.7)
+	paymentService := appPayment.NewService(orderRepo)
 	idGenerator := id.NewUUIDGenerator()
 
 	// Initialize structured logger

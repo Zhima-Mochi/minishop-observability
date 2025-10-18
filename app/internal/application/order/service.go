@@ -53,7 +53,7 @@ func (s *Service) CreateOrder(ctx context.Context, input CreateOrderInput) (*Cre
 		return nil, err
 	}
 
-	if err := s.repo.Save(ctx, entity); err != nil {
+	if err := s.repo.Insert(ctx, entity); err != nil {
 		logger.Error("order_save_failed", "order_id", entity.ID, "error", err)
 		return nil, fmt.Errorf("order: save: %w", err)
 	}
@@ -78,11 +78,7 @@ func (s *Service) Get(ctx context.Context, id string) (*domain.Order, error) {
 	if id == "" {
 		return nil, errors.New("order: id is required")
 	}
-	order, err := s.repo.FindByID(ctx, id)
-	if err != nil {
-		return nil, err
-	}
-	return order, nil
+	return s.repo.Get(ctx, id)
 }
 
 // Payment is handled by the payment service; order service does not process payments.

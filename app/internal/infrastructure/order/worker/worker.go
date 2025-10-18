@@ -40,7 +40,7 @@ func (w *Worker) handleInventoryReserved(ctx context.Context, e outbox.Event) er
 		return nil
 	}
 
-	order, err := w.repo.FindByID(ctx, evt.OrderID)
+	order, err := w.repo.Get(ctx, evt.OrderID)
 	if err != nil {
 		w.logError("order_load_failed", evt.OrderID, err)
 		return fmt.Errorf("order worker: find order: %w", err)
@@ -74,7 +74,7 @@ func (w *Worker) handleInventoryReservationFailed(ctx context.Context, e outbox.
 		return nil
 	}
 
-	order, err := w.repo.FindByID(ctx, evt.OrderID)
+	order, err := w.repo.Get(ctx, evt.OrderID)
 	if err != nil {
 		w.logError("order_load_failed", evt.OrderID, err)
 		return fmt.Errorf("order worker: find order: %w", err)
