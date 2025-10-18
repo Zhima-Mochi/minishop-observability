@@ -5,12 +5,17 @@ services:
       - "3100:3100"
     command: -config.file=/etc/loki/local-config.yaml
 
-  promtail:
-    image: grafana/promtail:3.0.0
+  otel-collector:
+    image: otel/opentelemetry-collector:latest
+    command: ["--config=/etc/otelcol-config.yaml"]
+    ports:
+      - "4317:4317"   # OTLP gRPC
+      - "4318:4318"   # OTLP HTTP
     volumes:
+      - ./observability/otelcol-config.yaml:/etc/otelcol-config.yaml:ro
       - ./logs:/var/log/minishop
-      - ./promtail.yaml:/etc/promtail/promtail.yaml
-    command: -config.file=/etc/promtail/promtail.yaml
+    depends_on:
+      - loki
 
   grafana:
     image: grafana/grafana:11.0.0
@@ -24,6 +29,16 @@ services:
       - grafana-storage:/var/lib/grafana
       - ./observability/provisioning:/etc/grafana/provisioning
       - ./observability/dashboards:/var/lib/grafana/dashboards
+
+  tempo:
+    image: grafana/tempo:latest
+    command: ["-config.file=/etc/tempo.yaml"]
+    ports:
+      - "3200:3200" # Tempo HTTP API
+      - "4317:4317" # OTLP gRPC
+      - "4318:4318" # OTLP HTTP
+    volumes:
+      - ./observability/tempo.yaml:/etc/tempo.yaml:ro
 
 volumes:
   grafana-storage:

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -28,8 +29,21 @@ func main() {
 	paymentService := appPayment.NewService(orderRepo)
 	idGenerator := id.NewUUIDGenerator()
 
-	// Initialize structured logger
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{}))
+	// Initialize structured logger (stdout + optional file for OTel Collector filelog)
+	var writers []io.Writer
+	writers = append(writers, os.Stdout)
+	if logFile := os.Getenv("LOG_FILE"); logFile != "" {
+		_ = os.MkdirAll("./logs", 0o755)
+		f, err := os.OpenFile(logFile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+		if err == nil {
+			writers = append(writers, f)
+			defer f.Close()
+		}
+	}
+	baseHandler := slog.NewJSONHandler(io.MultiWriter(writers...), &slog.HandlerOptions{})
+	serviceName := getenvDefault("SERVICE_NAME", "minishop")
+	env := getenvDefault("ENV", "dev")
+	logger := slog.New(baseHandler).With("service", serviceName, "env", env)
 	slog.SetDefault(logger)
 
 	// In-memory event bus (acts as outbox/event publisher for demo)
@@ -76,4 +90,11 @@ func main() {
 	} else {
 		logger.Info("http_server_stopped")
 	}
+}
+
+func getenvDefault(key, def string) string {
+    if v := os.Getenv(key); v != "" {
+        return v
+    }
+    return def
 }
