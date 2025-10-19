@@ -11,6 +11,7 @@ var (
 	ErrInvalidAmount          = errors.New("order: amount must be zero or greater")
 	ErrInvalidStateTransition = errors.New("order: invalid state transition")
 	ErrInvalidStatus          = errors.New("order: invalid status")
+	ErrConflict               = errors.New("order: conflict")
 )
 
 type Status string
@@ -24,20 +25,21 @@ const (
 )
 
 type Order struct {
-	ID            string
-	CustomerID    string
-	ProductID     string
-	Quantity      int
-	Amount        int64
-	Status        Status
-	FailureReason string
-	CreatedAt     time.Time
-	UpdatedAt     time.Time
+	ID             string
+	CustomerID     string
+	ProductID      string
+	IdempotencyKey string
+	Quantity       int
+	Amount         int64
+	Status         Status
+	FailureReason  string
+	CreatedAt      time.Time
+	UpdatedAt      time.Time
 
 	state OrderState
 }
 
-func New(id, customerID, productID string, quantity int, amount int64) (*Order, error) {
+func New(id, customerID, productID, idempotencyKey string, quantity int, amount int64) (*Order, error) {
 	if quantity <= 0 {
 		return nil, ErrInvalidQuantity
 	}
@@ -47,15 +49,16 @@ func New(id, customerID, productID string, quantity int, amount int64) (*Order, 
 
 	now := time.Now().UTC()
 	order := &Order{
-		ID:         id,
-		CustomerID: customerID,
-		ProductID:  productID,
-		Quantity:   quantity,
-		Amount:     amount,
-		Status:     StatusPending,
-		CreatedAt:  now,
-		UpdatedAt:  now,
-		state:      pendingState{},
+		ID:             id,
+		CustomerID:     customerID,
+		ProductID:      productID,
+		IdempotencyKey: idempotencyKey,
+		Quantity:       quantity,
+		Amount:         amount,
+		Status:         StatusPending,
+		CreatedAt:      now,
+		UpdatedAt:      now,
+		state:          pendingState{},
 	}
 	return order, nil
 }

@@ -10,6 +10,7 @@ import (
 	domorder "github.com/Zhima-Mochi/minishop-observability/app/internal/domain/order"
 	pstat "github.com/Zhima-Mochi/minishop-observability/app/internal/domain/payment"
 	"github.com/Zhima-Mochi/minishop-observability/app/internal/pkg/logging"
+	"go.uber.org/zap"
 )
 
 type Service struct {
@@ -29,8 +30,12 @@ func NewService(orderRepo domorder.Repository) *Service {
 
 // ProcessPayment checks order existence and status, then simulates payment and updates order state.
 func (s *Service) ProcessPayment(ctx context.Context, orderID string, amount int64) (pstat.Status, error) {
-	logger := logging.FromContext(ctx).With("component", "payment_service")
-	logger.Info("process_payment_start", "order_id", orderID, "amount", amount)
+	logger := logging.FromContext(ctx).With(zap.String("component", "payment_service"))
+	logger.Info("process_payment_start",
+		zap.String("use_case", "payment.process"),
+		zap.String("order_id", orderID),
+		zap.Int64("amount", amount),
+	)
 
 	if orderID == "" {
 		return pstat.StatusFailed, errors.New("payment: order id is required")
@@ -55,27 +60,49 @@ func (s *Service) ProcessPayment(ctx context.Context, orderID string, amount int
 
 	status, err := s.pay(ctx, order.ID, order.Amount)
 	if err != nil {
-		logger.Error("payment_error", "order_id", order.ID, "error", err)
+		logger.Error("payment_error",
+			zap.String("use_case", "payment.process"),
+			zap.String("order_id", order.ID),
+			zap.Error(err),
+		)
 		return pstat.StatusFailed, err
 	}
 
 	switch status {
 	case pstat.StatusSuccess:
 		if err := order.PaymentSucceeded(); err != nil {
-			logger.Error("payment_state_transition_failed", "order_id", order.ID, "error", err)
+			logger.Error("payment_state_transition_failed",
+				zap.String("use_case", "payment.process"),
+				zap.String("order_id", order.ID),
+				zap.Error(err),
+			)
 			return pstat.StatusFailed, err
 		}
-		logger.Info("payment_success", "order_id", order.ID)
+		logger.Info("payment_success",
+			zap.String("use_case", "payment.process"),
+			zap.String("order_id", order.ID),
+		)
 	default:
 		if err := order.PaymentFailed("payment_declined"); err != nil {
-			logger.Error("payment_state_transition_failed", "order_id", order.ID, "error", err)
+			logger.Error("payment_state_transition_failed",
+				zap.String("use_case", "payment.process"),
+				zap.String("order_id", order.ID),
+				zap.Error(err),
+			)
 			return pstat.StatusFailed, err
 		}
-		logger.Info("payment_failed", "order_id", order.ID)
+		logger.Info("payment_failed",
+			zap.String("use_case", "payment.process"),
+			zap.String("order_id", order.ID),
+		)
 	}
 
 	if err := s.orderRepo.Update(ctx, order); err != nil {
-		logger.Error("order_update_failed", "order_id", order.ID, "error", err)
+		logger.Error("order_update_failed",
+			zap.String("use_case", "payment.process"),
+			zap.String("order_id", order.ID),
+			zap.Error(err),
+		)
 		return pstat.StatusFailed, err
 	}
 

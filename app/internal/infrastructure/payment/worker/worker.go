@@ -7,6 +7,7 @@ import (
 	domorder "github.com/Zhima-Mochi/minishop-observability/app/internal/domain/order"
 	"github.com/Zhima-Mochi/minishop-observability/app/internal/infrastructure/outbox"
 	"github.com/Zhima-Mochi/minishop-observability/app/internal/pkg/logging"
+	"go.uber.org/zap"
 )
 
 type Worker struct {
@@ -26,7 +27,9 @@ func (w *Worker) Start() {
 }
 
 func (w *Worker) handleOrderInventoryReserved(ctx context.Context, e outbox.Event) error {
-	logger := logging.FromContext(ctx).With("component", "payment_worker")
+
+	logger := logging.FromContext(ctx).With(zap.String("component", "payment_worker"))
+
 	evt, ok := e.(domorder.OrderInventoryReservedEvent)
 	if !ok {
 		return nil
@@ -34,10 +37,16 @@ func (w *Worker) handleOrderInventoryReserved(ctx context.Context, e outbox.Even
 
 	status, err := w.service.ProcessPayment(ctx, evt.OrderID, 0)
 	if err != nil {
-		logger.Warn("payment_processing_failed", "order_id", evt.OrderID, "error", err)
+		logger.Warn("payment_processing_failed",
+			zap.String("order_id", evt.OrderID),
+			zap.Error(err),
+		)
 		return err
 	}
 
-	logger.Info("payment_processed", "order_id", evt.OrderID, "status", status)
+	logger.Info("payment_processed",
+		zap.String("order_id", evt.OrderID),
+		zap.String("status", string(status)),
+	)
 	return nil
 }

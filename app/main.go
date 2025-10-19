@@ -3,8 +3,6 @@ package main
 import (
 	"context"
 	"errors"
-	"io"
-	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -21,6 +19,10 @@ import (
 	orderworker "github.com/Zhima-Mochi/minishop-observability/app/internal/infrastructure/order/worker"
 	"github.com/Zhima-Mochi/minishop-observability/app/internal/infrastructure/outbox"
 	paymentworker "github.com/Zhima-Mochi/minishop-observability/app/internal/infrastructure/payment/worker"
+	"github.com/Zhima-Mochi/minishop-observability/app/internal/pkg/logging"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"go.uber.org/zap"
 )
 
 func main() {
@@ -29,25 +31,40 @@ func main() {
 	paymentService := appPayment.NewService(orderRepo)
 	idGenerator := id.NewUUIDGenerator()
 
-	// Initialize structured logger (stdout + optional file for OTel Collector filelog)
-	var writers []io.Writer
-	writers = append(writers, os.Stdout)
-	if logFile := os.Getenv("LOG_FILE"); logFile != "" {
-		_ = os.MkdirAll("./logs", 0o755)
-		f, err := os.OpenFile(logFile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
-		if err == nil {
-			writers = append(writers, f)
-			defer f.Close()
-		}
-	}
-	baseHandler := slog.NewJSONHandler(io.MultiWriter(writers...), &slog.HandlerOptions{})
 	serviceName := getenvDefault("SERVICE_NAME", "minishop")
 	env := getenvDefault("ENV", "dev")
-	logger := slog.New(baseHandler).With("service", serviceName, "env", env)
-	slog.SetDefault(logger)
+	baseLogger := logging.MustNewLogger(serviceName, env)
+	defer func() { _ = baseLogger.Sync() }()
+	zap.ReplaceGlobals(baseLogger)
+
+	systemLogger := logging.WithTrace(baseLogger, logging.SystemTraceID, logging.SystemSpanID)
+
+	usecaseRequests := prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "usecase_requests_total",
+			Help: "Total number of use case invocations.",
+		},
+		[]string{"use_case", "outcome"},
+	)
+	usecaseDurations := prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "usecase_duration_seconds",
+			Help:    "Duration of use case execution in seconds.",
+			Buckets: prometheus.DefBuckets,
+		},
+		[]string{"use_case"},
+	)
+	orderEventPublishFailures := prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "order_event_publish_failed_total",
+			Help: "Count of order-related event publish failures.",
+		},
+		[]string{"event"},
+	)
+	prometheus.MustRegister(usecaseRequests, usecaseDurations, orderEventPublishFailures)
 
 	// In-memory event bus (acts as outbox/event publisher for demo)
-	bus := outbox.NewBus(logger.With("component", "outbox"))
+	bus := outbox.NewBus()
 	bus.Start(context.Background())
 	defer bus.Stop(context.Background())
 
@@ -56,27 +73,34 @@ func main() {
 
 	inventoryService := appInventory.NewService(inventoryRepo, bus)
 	inventoryWorker := inventoryworker.New(bus, inventoryService)
-	orderWorker := orderworker.New(orderRepo, bus, bus, logger.With("component", "order_worker"))
+	orderWorker := orderworker.New(orderRepo, bus, bus)
 	paymentWorker := paymentworker.New(bus, paymentService)
 
 	inventoryWorker.Start()
 	orderWorker.Start()
 	paymentWorker.Start()
-	handler := httptransport.NewHandler(orderService, paymentService, logger.With("component", "http"))
+	handler := httptransport.NewHandler(orderService, paymentService)
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", promhttp.Handler())
+	mux.Handle("/", handler.Router())
 
 	server := &http.Server{
 		Addr:    ":8080",
-		Handler: handler.Router(),
+		Handler: mux,
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	go func() {
-		logger.Info("http_server_start", "addr", server.Addr)
+		systemLogger.Info("http_server_start",
+			zap.String("addr", server.Addr),
+		)
 		err := server.ListenAndServe()
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {
-			logger.Error("http_server_error", "error", err)
+			systemLogger.Error("http_server_error",
+				zap.Error(err),
+			)
 		}
 	}()
 
@@ -86,15 +110,17 @@ func main() {
 	defer cancel()
 
 	if err := server.Shutdown(shutdownCtx); err != nil {
-		logger.Error("http_server_shutdown_error", "error", err)
+		systemLogger.Error("http_server_shutdown_error",
+			zap.Error(err),
+		)
 	} else {
-		logger.Info("http_server_stopped")
+		systemLogger.Info("http_server_stopped")
 	}
 }
 
 func getenvDefault(key, def string) string {
-    if v := os.Getenv(key); v != "" {
-        return v
-    }
-    return def
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
 }

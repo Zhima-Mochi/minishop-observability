@@ -2,10 +2,12 @@ package outbox
 
 import (
 	"context"
-	"log/slog"
 	"runtime/debug"
 	"sync"
 	"time"
+
+	"github.com/Zhima-Mochi/minishop-observability/app/internal/pkg/logging"
+	"go.uber.org/zap"
 )
 
 // Event is any domain event with a name identifier.
@@ -30,7 +32,6 @@ type Bus struct {
 	mu          sync.RWMutex
 	subs        map[string][]Handler
 	queue       chan Event
-	log         *slog.Logger
 	startOnce   sync.Once
 	stopOnce    sync.Once
 	cancel      context.CancelFunc
@@ -38,12 +39,11 @@ type Bus struct {
 }
 
 // NewBus creates a bus with a buffered queue and a concurrency cap.
-func NewBus(logger *slog.Logger) *Bus {
+func NewBus() *Bus {
 	return &Bus{
 		subs:        make(map[string][]Handler),
 		queue:       make(chan Event, 1024), // buffer for backpressure
-		log:         logger,
-		concurrency: 8, // per-event handler fanout cap
+		concurrency: 8,                      // per-event handler fanout cap
 	}
 }
 
@@ -55,12 +55,11 @@ func (b *Bus) Subscribe(eventName string, h Handler) {
 
 func (b *Bus) Start(ctx context.Context) {
 	b.startOnce.Do(func() {
-		bg, cancel := context.WithCancel(context.Background())
+		bg, cancel := context.WithCancel(ctx)
 		b.cancel = cancel
 		go b.dispatchLoop(bg)
-		if b.log != nil {
-			b.log.Info("event_bus_started")
-		}
+		logger := logging.FromContext(ctx).With(zap.String("component", "outbox"))
+		logger.Info("event_bus_started")
 	})
 }
 
@@ -71,9 +70,8 @@ func (b *Bus) Stop(ctx context.Context) {
 		}
 
 		close(b.queue)
-		if b.log != nil {
-			b.log.Info("event_bus_stopped")
-		}
+		logger := logging.FromContext(ctx).With(zap.String("component", "outbox"))
+		logger.Info("event_bus_stopped")
 	})
 }
 
@@ -83,14 +81,15 @@ func (b *Bus) Publish(ctx context.Context, e Event) error {
 	}
 	select {
 	case b.queue <- e:
-		if b.log != nil {
-			b.log.Debug("event_enqueued", "event", e.EventName())
-		}
+		logger := logging.FromContext(ctx).With(zap.String("component", "outbox"))
+		logger.Debug("event_enqueued", zap.String("event", e.EventName()))
 		return nil
 	case <-ctx.Done():
-		if b.log != nil {
-			b.log.Warn("event_enqueue_aborted", "event", e.EventName(), "reason", ctx.Err())
-		}
+		logger := logging.FromContext(ctx).With(zap.String("component", "outbox"))
+		logger.Warn("event_enqueue_aborted",
+			zap.String("event", e.EventName()),
+			zap.Error(ctx.Err()),
+		)
 		return ctx.Err()
 	}
 }
@@ -117,9 +116,8 @@ func (b *Bus) fanout(ctx context.Context, e Event) {
 	b.mu.RUnlock()
 
 	if len(handlers) == 0 {
-		if b.log != nil {
-			b.log.Debug("event_dropped_no_subscriber", "event", name)
-		}
+		logger := logging.FromContext(ctx).With(zap.String("component", "outbox"))
+		logger.Debug("event_dropped_no_subscriber", zap.String("event", name))
 		return
 	}
 
@@ -133,8 +131,13 @@ func (b *Bus) fanout(ctx context.Context, e Event) {
 		wg.Add(1)
 		go func() {
 			defer func() {
-				if r := recover(); r != nil && b.log != nil {
-					b.log.Error("event_handler_panic", "event", name, "panic", r, "stack", string(debug.Stack()))
+				if r := recover(); r != nil {
+					logger := logging.FromContext(ctx).With(zap.String("component", "outbox"))
+					logger.Error("event_handler_panic",
+						zap.String("event", name),
+						zap.Any("panic", r),
+						zap.String("stack", string(debug.Stack())),
+					)
 				}
 				<-sem
 				wg.Done()
@@ -143,15 +146,21 @@ func (b *Bus) fanout(ctx context.Context, e Event) {
 			hctx, cancel := context.WithTimeout(bg, 30*time.Second)
 			err := h(hctx, e)
 			cancel()
-			if err != nil && b.log != nil {
-				b.log.Warn("event_handler_error", "event", name, "error", err)
+			if err != nil {
+				logger := logging.FromContext(ctx).With(zap.String("component", "outbox"))
+				logger.Warn("event_handler_error",
+					zap.String("event", name),
+					zap.Error(err),
+				)
 			}
 		}()
 	}
 
 	wg.Wait()
 
-	if b.log != nil {
-		b.log.Debug("event_fanned_out", "event", name, "handlers", len(handlers))
-	}
+	logger := logging.FromContext(ctx).With(zap.String("component", "outbox"))
+	logger.Debug("event_fanned_out",
+		zap.String("event", name),
+		zap.Int("handlers", len(handlers)),
+	)
 }

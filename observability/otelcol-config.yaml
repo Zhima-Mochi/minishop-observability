@@ -11,30 +11,38 @@ receivers:
         parse_from: body
         timestamp:
           parse_from: body.time
-          layout: '%Y-%m-%dT%H:%M:%S.%fZ'
+          layout_type: gotime
+          layout: '2006-01-02T15:04:05.999999999Z07:00'
       - type: severity_parser
         parse_from: body.level
+      # Move selected fields from body -> attributes for labeling
       - type: move
-        from: body
-        to: attributes
+        from: body.level
+        to: attributes.level
+      - type: move
+        from: body.service
+        to: attributes.service
+      - type: move
+        from: body.env
+        to: attributes.env
+      - type: move
+        from: body.component
+        to: attributes.component
+      - type: move
+        from: body.use_case
+        to: attributes.use_case
+      # Set final log body to the message string if present
+      - type: move
+        from: body.msg
+        to: body
 
 processors:
   batch: {}
 
 exporters:
-  loki:
-    endpoint: http://loki:3100/loki/api/v1/push
-    labels:
-      attributes:
-        level: level
-        service: service
-        env: env
-        component: component
-        use_case: use_case
-    default_labels_enabled:
-      exporter: false
-      job: false
-      instance: false
+  otlphttp/loki:
+    endpoint: http://loki:3100
+    logs_endpoint: http://loki:3100/otlp/v1/logs
   otlp/tempo:
     endpoint: tempo:4317
     tls:
@@ -45,7 +53,7 @@ service:
     logs:
       receivers: [filelog]
       processors: [batch]
-      exporters: [loki]
+      exporters: [otlphttp/loki]
     traces:
       receivers: [otlp]
       processors: [batch]

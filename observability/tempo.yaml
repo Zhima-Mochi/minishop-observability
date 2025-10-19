@@ -10,7 +10,7 @@ distributor:
 
 ingester:
   trace_idle_period: 10s
-  max_block_bytes: 1_048_576
+  max_block_bytes: 1048576
   max_block_duration: 5m
 
 compactor:
@@ -26,6 +26,5 @@ storage:
     backend: local
     local:
       path: /tmp/tempo/traces
-  wal:
-    path: /tmp/tempo/wal
-
+    wal:
+      path: /tmp/tempo/wal

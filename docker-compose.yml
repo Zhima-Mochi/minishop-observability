@@ -6,16 +6,17 @@ services:
     command: -config.file=/etc/loki/local-config.yaml
 
   otel-collector:
-    image: otel/opentelemetry-collector:latest
+    image: otel/opentelemetry-collector-contrib:latest
     command: ["--config=/etc/otelcol-config.yaml"]
     ports:
-      - "4317:4317"   # OTLP gRPC
+      # - "4317:4317"   # OTLP gRPC
       - "4318:4318"   # OTLP HTTP
     volumes:
       - ./observability/otelcol-config.yaml:/etc/otelcol-config.yaml:ro
       - ./logs:/var/log/minishop
     depends_on:
       - loki
+      - tempo
 
   grafana:
     image: grafana/grafana:11.0.0
@@ -35,8 +36,6 @@ services:
     command: ["-config.file=/etc/tempo.yaml"]
     ports:
       - "3200:3200" # Tempo HTTP API
-      - "4317:4317" # OTLP gRPC
-      - "4318:4318" # OTLP HTTP
     volumes:
       - ./observability/tempo.yaml:/etc/tempo.yaml:ro
 
