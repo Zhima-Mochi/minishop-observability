@@ -12,74 +12,90 @@ import (
 	appInventory "github.com/Zhima-Mochi/minishop-observability/app/internal/application/inventory"
 	appOrder "github.com/Zhima-Mochi/minishop-observability/app/internal/application/order"
 	appPayment "github.com/Zhima-Mochi/minishop-observability/app/internal/application/payment"
-	httptransport "github.com/Zhima-Mochi/minishop-observability/app/internal/infrastructure/http"
 	"github.com/Zhima-Mochi/minishop-observability/app/internal/infrastructure/id"
-	inventoryworker "github.com/Zhima-Mochi/minishop-observability/app/internal/infrastructure/inventory/worker"
 	"github.com/Zhima-Mochi/minishop-observability/app/internal/infrastructure/memory"
-	orderworker "github.com/Zhima-Mochi/minishop-observability/app/internal/infrastructure/order/worker"
+	"github.com/Zhima-Mochi/minishop-observability/app/internal/infrastructure/observability/oteltrace"
+	"github.com/Zhima-Mochi/minishop-observability/app/internal/infrastructure/observability/prometrics"
+	"github.com/Zhima-Mochi/minishop-observability/app/internal/infrastructure/observability/telemetry"
+	"github.com/Zhima-Mochi/minishop-observability/app/internal/infrastructure/observability/zaplogger"
 	"github.com/Zhima-Mochi/minishop-observability/app/internal/infrastructure/outbox"
-	paymentworker "github.com/Zhima-Mochi/minishop-observability/app/internal/infrastructure/payment/worker"
-	"github.com/Zhima-Mochi/minishop-observability/app/internal/pkg/logging"
+	"github.com/Zhima-Mochi/minishop-observability/app/internal/observability"
+	httppresentation "github.com/Zhima-Mochi/minishop-observability/app/internal/presentation/http"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
-	"go.uber.org/zap"
 )
 
 func main() {
-	orderRepo := memory.NewOrderRepository()
-	inventoryRepo := memory.NewInventoryRepository()
-	paymentService := appPayment.NewService(orderRepo)
-	idGenerator := id.NewUUIDGenerator()
-
 	serviceName := getenvDefault("SERVICE_NAME", "minishop")
 	env := getenvDefault("ENV", "dev")
-	baseLogger := logging.MustNewLogger(serviceName, env)
-	defer func() { _ = baseLogger.Sync() }()
-	zap.ReplaceGlobals(baseLogger)
 
-	systemLogger := logging.WithTrace(baseLogger, logging.SystemTraceID, logging.SystemSpanID)
+	baseLogger := zaplogger.New(
+		observability.F("service", serviceName),
+		observability.F("env", env),
+	)
+	if syncer, ok := baseLogger.(interface{ Sync() error }); ok {
+		defer func() { _ = syncer.Sync() }()
+	}
 
-	usecaseRequests := prometheus.NewCounterVec(
-		prometheus.CounterOpts{
-			Name: "usecase_requests_total",
-			Help: "Total number of use case invocations.",
-		},
-		[]string{"use_case", "outcome"},
+	metrics := prometrics.New(serviceName, "app")
+	usecaseRequests := metrics.Counter(
+		"usecase_requests_total",
+		"Total number of use case invocations.",
+		"use_case", "outcome",
 	)
-	usecaseDurations := prometheus.NewHistogramVec(
-		prometheus.HistogramOpts{
-			Name:    "usecase_duration_seconds",
-			Help:    "Duration of use case execution in seconds.",
-			Buckets: prometheus.DefBuckets,
-		},
-		[]string{"use_case"},
+	usecaseDurations := metrics.Histogram(
+		"usecase_duration_seconds",
+		"Duration of use case execution in seconds.",
+		prometheus.DefBuckets,
+		"use_case",
 	)
-	orderEventPublishFailures := prometheus.NewCounterVec(
-		prometheus.CounterOpts{
-			Name: "order_event_publish_failed_total",
-			Help: "Count of order-related event publish failures.",
-		},
-		[]string{"event"},
+	httpRequests := metrics.Counter(
+		"http_requests_total",
+		"Total number of HTTP requests.",
+		"method", "route", "status",
 	)
-	prometheus.MustRegister(usecaseRequests, usecaseDurations, orderEventPublishFailures)
+	httpDurations := metrics.Histogram(
+		"http_request_duration_seconds",
+		"Duration of HTTP request handling in seconds.",
+		prometheus.DefBuckets,
+		"method", "route", "status",
+	)
+
+	tel := telemetry.New(
+		oteltrace.New(serviceName),
+		baseLogger,
+		map[string]observability.Counter{
+			"usecase_requests_total": usecaseRequests,
+			"http_requests_total":    httpRequests,
+		},
+		map[string]observability.Histogram{
+			"usecase_duration_seconds":      usecaseDurations,
+			"http_request_duration_seconds": httpDurations,
+		},
+	)
+
+	orderRepo := memory.NewOrderRepository()
+	inventoryRepo := memory.NewInventoryRepository()
+	idGenerator := id.NewUUIDGenerator()
 
 	// In-memory event bus (acts as outbox/event publisher for demo)
-	bus := outbox.NewBus()
+	bus := outbox.NewBus(baseLogger, tel)
 	bus.Start(context.Background())
 	defer bus.Stop(context.Background())
 
 	// Order service publishes events instead of mutating other contexts directly
-	orderService := appOrder.NewService(orderRepo, idGenerator, bus)
+	orderService := appOrder.NewService(orderRepo, idGenerator, bus, tel)
+	paymentService := appPayment.NewService(orderRepo, tel)
 
-	inventoryService := appInventory.NewService(inventoryRepo, bus)
-	inventoryWorker := inventoryworker.New(bus, inventoryService)
-	orderWorker := orderworker.New(orderRepo, bus, bus)
-	paymentWorker := paymentworker.New(bus, paymentService)
+	inventoryService := appInventory.NewService(inventoryRepo, bus, tel)
+	inventoryWorker := appInventory.New(bus, inventoryService, tel, baseLogger)
+	orderWorker := appOrder.New(orderRepo, bus, bus, tel, baseLogger)
+	paymentWorker := appPayment.New(bus, paymentService, tel)
 
 	inventoryWorker.Start()
 	orderWorker.Start()
 	paymentWorker.Start()
-	handler := httptransport.NewHandler(orderService, paymentService)
+	handler := httppresentation.NewHandler(orderService, paymentService, baseLogger, tel)
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.Handler())
 	mux.Handle("/", handler.Router())
@@ -89,17 +105,21 @@ func main() {
 		Handler: mux,
 	}
 
+	systemLogger := tel.Logger().With(
+		observability.F("component", "system"),
+	)
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	go func() {
 		systemLogger.Info("http_server_start",
-			zap.String("addr", server.Addr),
+			observability.F("addr", server.Addr),
 		)
 		err := server.ListenAndServe()
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {
 			systemLogger.Error("http_server_error",
-				zap.Error(err),
+				observability.F("error", err),
 			)
 		}
 	}()
@@ -111,7 +131,7 @@ func main() {
 
 	if err := server.Shutdown(shutdownCtx); err != nil {
 		systemLogger.Error("http_server_shutdown_error",
-			zap.Error(err),
+			observability.F("error", err),
 		)
 	} else {
 		systemLogger.Info("http_server_stopped")

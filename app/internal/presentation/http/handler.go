@@ -1,10 +1,11 @@
-package httptransport
+package httppresentation
 
 import (
 	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -13,49 +14,84 @@ import (
 	domainInventory "github.com/Zhima-Mochi/minishop-observability/app/internal/domain/inventory"
 	domainOrder "github.com/Zhima-Mochi/minishop-observability/app/internal/domain/order"
 	domainPayment "github.com/Zhima-Mochi/minishop-observability/app/internal/domain/payment"
-	"github.com/Zhima-Mochi/minishop-observability/app/internal/pkg/logging"
-	"github.com/google/uuid"
-	"github.com/prometheus/client_golang/prometheus"
+	"github.com/Zhima-Mochi/minishop-observability/app/internal/observability"
+	"github.com/Zhima-Mochi/minishop-observability/app/internal/observability/logctx"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/trace"
-	"go.uber.org/zap"
 )
 
 type Handler struct {
 	orderService   *appOrder.Service
 	paymentService *appPayment.Service
+	log            observability.Logger
+	tel            observability.Telemetry
 }
 
-func NewHandler(orderSvc *appOrder.Service, paymentSvc *appPayment.Service) *Handler {
+const (
+	componentHTTPHandler = "http_server"
+	headerRequestID      = "X-Request-ID"
+	headerTenantID       = "X-Tenant-ID"
+)
+
+func NewHandler(orderSvc *appOrder.Service, paymentSvc *appPayment.Service, logger observability.Logger,
+	tel observability.Telemetry,
+) *Handler {
+	baseLogger := logger
+	if baseLogger == nil {
+		baseLogger = observability.NopLogger()
+	}
 	return &Handler{
 		orderService:   orderSvc,
 		paymentService: paymentSvc,
+		log:            baseLogger.With(observability.F("component", componentHTTPHandler)),
+		tel:            tel,
 	}
 }
 
-func muxHandle(mux *http.ServeMux, method, route string, handler http.HandlerFunc) {
+func (h *Handler) Router() http.Handler {
+	mux := http.NewServeMux()
+
+	// Wire each route with middlewares:
+	// Trace → ObservabilityMiddleware (request logger) → HTTP metrics → Access log → Handler
+	h.muxHandle(mux, http.MethodPost, "/order", h.handleCreateOrder)
+	h.muxHandle(mux, http.MethodPost, "/payment/pay", h.handleProcessPayment)
+	h.muxHandle(mux, http.MethodGet, "/health", h.handleHealth)
+
+	return mux
+}
+
+func (h *Handler) muxHandle(mux *http.ServeMux, method, route string, handler http.HandlerFunc) {
 	mux.HandleFunc(route, func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != method {
 			w.WriteHeader(http.StatusMethodNotAllowed)
 			return
 		}
 
+		// Store stable route template for low-cardinality labels
 		ctx := contextWithRoute(r.Context(), route)
 		r = r.WithContext(ctx)
 
-		withMetrics(withTrace(withLogging(handler))).ServeHTTP(w, r)
+		// Wrap: Trace → Request Logger → Metrics → Access Log → Handler
+		wrapped := h.withTrace(
+			ObservabilityMiddleware(
+				logctx.FromOr(ctx, h.log),
+				func(r *http.Request) string {
+					return r.Header.Get(headerRequestID)
+				},
+				func(r *http.Request) string {
+					return r.Header.Get(headerTenantID)
+				},
+				h.tel,
+			)(
+				h.withAccessLog(
+					h.withHTTPMetrics(http.HandlerFunc(handler)),
+				),
+			),
+		)
+		wrapped.ServeHTTP(w, r)
 	})
-}
-
-func (h *Handler) Router() http.Handler {
-	mux := http.NewServeMux()
-
-	muxHandle(mux, http.MethodPost, "/order", h.handleCreateOrder)
-	muxHandle(mux, http.MethodPost, "/payment/pay", h.handleProcessPayment)
-	muxHandle(mux, http.MethodGet, "/health", h.handleHealth)
-
-	return mux
 }
 
 type createOrderRequest struct {
@@ -72,16 +108,8 @@ type createOrderResponse struct {
 }
 
 func (h *Handler) handleCreateOrder(w http.ResponseWriter, r *http.Request) {
-	logger := logging.FromContext(r.Context())
-	route := routeFromContext(r.Context())
 	var req createOrderRequest
 	if err := decodeJSON(r.Context(), r, &req); err != nil {
-		logger.Warn("bad_request",
-			zap.String("use_case", "order.createOrder"),
-			zap.String("route", route),
-			zap.String("path", r.URL.Path),
-			zap.Error(err),
-		)
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
@@ -94,14 +122,6 @@ func (h *Handler) handleCreateOrder(w http.ResponseWriter, r *http.Request) {
 		Amount:         req.Amount,
 	})
 	if err != nil {
-		logger.Error("create_order_failed",
-			zap.String("use_case", "order.createOrder"),
-			zap.String("customer_id", req.CustomerID),
-			zap.String("product_id", req.ProductID),
-			zap.Int("quantity", req.Quantity),
-			zap.Int64("amount", req.Amount),
-			zap.Error(err),
-		)
 		writeDomainError(w, err)
 		return
 	}
@@ -123,28 +143,14 @@ type processPaymentResponse struct {
 }
 
 func (h *Handler) handleProcessPayment(w http.ResponseWriter, r *http.Request) {
-	logger := logging.FromContext(r.Context())
-	route := routeFromContext(r.Context())
 	var req processPaymentRequest
 	if err := decodeJSON(r.Context(), r, &req); err != nil {
-		logger.Warn("bad_request",
-			zap.String("use_case", "payment.processPayment"),
-			zap.String("route", route),
-			zap.String("path", r.URL.Path),
-			zap.Error(err),
-		)
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
 
 	status, err := h.paymentService.ProcessPayment(r.Context(), req.OrderID, req.Amount)
 	if err != nil {
-		logger.Error("payment_failed",
-			zap.String("use_case", "payment.processPayment"),
-			zap.String("order_id", req.OrderID),
-			zap.Int64("amount", req.Amount),
-			zap.Error(err),
-		)
 		writeDomainError(w, err)
 		return
 	}
@@ -160,39 +166,32 @@ func (h *Handler) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	_, _ = w.Write([]byte("ok"))
 }
 
-// withLogging adds a simple access log around the handler.
-func withLogging(next http.Handler) http.Handler {
+// withAccessLog writes a single access log after the handler completes.
+// It relies on the request-scoped logger already injected by ObservabilityMiddleware.
+func (h *Handler) withAccessLog(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 		lrw := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
 
-		logger := logging.FromContext(r.Context())
-		sc := trace.SpanContextFromContext(r.Context())
-		if sc.IsValid() {
-			logger = logging.WithTrace(logger, sc.TraceID().String(), sc.SpanID().String())
-		} else {
-			rid := uuid.NewString()
-			logger = logger.With(zap.String("request_id", rid))
-		}
+		next.ServeHTTP(lrw, r)
 
-		// store logger in context for downstream logging
-		ctx := logging.ContextWithLogger(r.Context(), logger)
-		next.ServeHTTP(lrw, r.WithContext(ctx))
-
-		logger.Info("http_request",
-			zap.String("method", r.Method),
-			zap.String("route", routeFromContext(ctx)),
-			zap.String("path", r.URL.Path),
-			zap.Int("status", lrw.status),
-			zap.Int64("duration_ms", time.Since(start).Milliseconds()),
+		logctx.FromOr(r.Context(), h.log).Info("http_access",
+			observability.F("method", r.Method),
+			observability.F("route", routeFromContext(r.Context())),
+			observability.F("path", r.URL.Path),
+			observability.F("status", lrw.status),
+			observability.F("latency_ms", time.Since(start).Milliseconds()),
 		)
 	})
 }
 
-func withTrace(next http.Handler) http.Handler {
+// withTrace creates a server span for the request using OTel and W3C propagation.
+func (h *Handler) withTrace(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		tracer := otel.Tracer("minishop.http")
-		route := routeFromContext(r.Context())
+		parentCtx := otel.GetTextMapPropagator().Extract(r.Context(), propagation.HeaderCarrier(r.Header))
+
+		route := routeFromContext(parentCtx)
 		spanName := route
 		if spanName == "unknown" {
 			spanName = r.Method + " " + r.URL.Path
@@ -205,7 +204,7 @@ func withTrace(next http.Handler) http.Handler {
 			template = r.URL.Path
 		}
 
-		ctx, span := tracer.Start(r.Context(),
+		ctxWithSpan, span := tracer.Start(parentCtx,
 			spanName,
 			trace.WithSpanKind(trace.SpanKindServer),
 			trace.WithAttributes(
@@ -217,31 +216,26 @@ func withTrace(next http.Handler) http.Handler {
 		)
 		defer span.End()
 
-		next.ServeHTTP(w, r.WithContext(ctx))
+		next.ServeHTTP(w, r.WithContext(ctxWithSpan))
 	})
 }
 
-func withMetrics(next http.Handler) http.Handler {
-	reqs := prometheus.NewCounterVec(prometheus.CounterOpts{}, []string{"method", "route", "status"})
-	dur := prometheus.NewHistogramVec(prometheus.HistogramOpts{}, []string{"method", "route", "status"})
-
+// withHTTPMetrics records RED-ish HTTP metrics using injected vectors.
+// DO NOT new metrics inside the middleware.
+func (h *Handler) withHTTPMetrics(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 		lrw := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+
 		next.ServeHTTP(lrw, r)
-		reqs.WithLabelValues(r.Method, routeFromContext(r.Context()), http.StatusText(lrw.status)).Inc()
-		dur.WithLabelValues(r.Method, routeFromContext(r.Context()), http.StatusText(lrw.status)).Observe(time.Since(start).Seconds())
+
+		if h.tel != nil {
+			h.tel.Counter("http_requests_total").Add(1, observability.L("method", r.Method), observability.L("route", routeFromContext(r.Context())), observability.L("status", strconv.Itoa(lrw.status)))
+		}
+		if h.tel != nil {
+			h.tel.Histogram("http_request_duration_seconds").Observe(time.Since(start).Seconds(), observability.L("method", r.Method), observability.L("route", routeFromContext(r.Context())), observability.L("status", strconv.Itoa(lrw.status)))
+		}
 	})
-}
-
-type statusRecorder struct {
-	http.ResponseWriter
-	status int
-}
-
-func (w *statusRecorder) WriteHeader(statusCode int) {
-	w.status = statusCode
-	w.ResponseWriter.WriteHeader(statusCode)
 }
 
 func decodeJSON(ctx context.Context, r *http.Request, dst any) error {
@@ -266,8 +260,6 @@ func writeError(w http.ResponseWriter, status int, err error) {
 
 func writeDomainError(w http.ResponseWriter, err error) {
 	switch {
-	case appOrder.IsValidation(err):
-		writeError(w, http.StatusBadRequest, err)
 	case errors.Is(err, domainOrder.ErrNotFound),
 		errors.Is(err, domainInventory.ErrNotFound):
 		writeError(w, http.StatusNotFound, err)

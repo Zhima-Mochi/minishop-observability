@@ -6,48 +6,39 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Zhima-Mochi/minishop-observability/app/internal/pkg/logging"
-	"go.uber.org/zap"
+	domoutbox "github.com/Zhima-Mochi/minishop-observability/app/internal/domain/outbox"
+	"github.com/Zhima-Mochi/minishop-observability/app/internal/observability"
+	"github.com/Zhima-Mochi/minishop-observability/app/internal/observability/logctx"
 )
-
-// Event is any domain event with a name identifier.
-type Event interface{ EventName() string }
-
-// Handler processes a published event.
-type Handler func(ctx context.Context, e Event) error
-
-// Publisher publishes events to interested subscribers.
-type Publisher interface {
-	Publish(ctx context.Context, e Event) error
-}
-
-// Subscriber registers handlers for event names.
-type Subscriber interface {
-	Subscribe(eventName string, h Handler)
-}
 
 // Bus is an in-memory event bus suitable for demo/testing and simple outbox-like fanout.
 // It is not durable; for production use, persist events (true Outbox pattern) and dispatch from a worker.
 type Bus struct {
 	mu          sync.RWMutex
-	subs        map[string][]Handler
-	queue       chan Event
+	subs        map[string][]domoutbox.Handler
+	queue       chan domoutbox.Event
 	startOnce   sync.Once
 	stopOnce    sync.Once
 	cancel      context.CancelFunc
 	concurrency int
+	log         observability.Logger
+	tel         observability.Telemetry
 }
 
 // NewBus creates a bus with a buffered queue and a concurrency cap.
-func NewBus() *Bus {
+const componentOutbox = "outbox"
+
+func NewBus(logger observability.Logger, tel observability.Telemetry) *Bus {
 	return &Bus{
-		subs:        make(map[string][]Handler),
-		queue:       make(chan Event, 1024), // buffer for backpressure
-		concurrency: 8,                      // per-event handler fanout cap
+		subs:        make(map[string][]domoutbox.Handler),
+		queue:       make(chan domoutbox.Event, 1024), // buffer for backpressure
+		concurrency: 8,                                // per-event handler fanout cap
+		log:         logger.With(observability.F("component", componentOutbox)),
+		tel:         tel,
 	}
 }
 
-func (b *Bus) Subscribe(eventName string, h Handler) {
+func (b *Bus) Subscribe(eventName string, h domoutbox.Handler) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.subs[eventName] = append(b.subs[eventName], h)
@@ -58,7 +49,7 @@ func (b *Bus) Start(ctx context.Context) {
 		bg, cancel := context.WithCancel(ctx)
 		b.cancel = cancel
 		go b.dispatchLoop(bg)
-		logger := logging.FromContext(ctx).With(zap.String("component", "outbox"))
+		logger := logctx.FromOr(ctx, b.log)
 		logger.Info("event_bus_started")
 	})
 }
@@ -70,25 +61,24 @@ func (b *Bus) Stop(ctx context.Context) {
 		}
 
 		close(b.queue)
-		logger := logging.FromContext(ctx).With(zap.String("component", "outbox"))
+		logger := logctx.FromOr(ctx, b.log)
 		logger.Info("event_bus_stopped")
 	})
 }
 
-func (b *Bus) Publish(ctx context.Context, e Event) error {
+func (b *Bus) Publish(ctx context.Context, e domoutbox.Event) error {
 	if e == nil {
 		return nil
 	}
 	select {
 	case b.queue <- e:
-		logger := logging.FromContext(ctx).With(zap.String("component", "outbox"))
-		logger.Debug("event_enqueued", zap.String("event", e.EventName()))
+		logger := logctx.FromOr(ctx, b.log).With(observability.F("event", e.EventName()))
+		logger.Debug("event_enqueued")
 		return nil
 	case <-ctx.Done():
-		logger := logging.FromContext(ctx).With(zap.String("component", "outbox"))
+		logger := logctx.FromOr(ctx, b.log).With(observability.F("event", e.EventName()))
 		logger.Warn("event_enqueue_aborted",
-			zap.String("event", e.EventName()),
-			zap.Error(ctx.Err()),
+			observability.F("error", ctx.Err()),
 		)
 		return ctx.Err()
 	}
@@ -108,20 +98,22 @@ func (b *Bus) dispatchLoop(ctx context.Context) {
 	}
 }
 
-func (b *Bus) fanout(ctx context.Context, e Event) {
+func (b *Bus) fanout(ctx context.Context, e domoutbox.Event) {
 	name := e.EventName()
 
 	b.mu.RLock()
-	handlers := append([]Handler(nil), b.subs[name]...)
+	handlers := append([]domoutbox.Handler(nil), b.subs[name]...)
 	b.mu.RUnlock()
 
 	if len(handlers) == 0 {
-		logger := logging.FromContext(ctx).With(zap.String("component", "outbox"))
-		logger.Debug("event_dropped_no_subscriber", zap.String("event", name))
+		logger := logctx.FromOr(ctx, b.log).With(observability.F("event", name))
+		logger.Debug("event_dropped_no_subscriber")
 		return
 	}
 
-	bg := context.WithoutCancel(ctx)
+	ctx = context.WithoutCancel(ctx)
+	baseLogger := b.log
+	ctx = logctx.With(ctx, baseLogger)
 
 	sem := make(chan struct{}, b.concurrency)
 	var wg sync.WaitGroup
@@ -132,25 +124,24 @@ func (b *Bus) fanout(ctx context.Context, e Event) {
 		go func() {
 			defer func() {
 				if r := recover(); r != nil {
-					logger := logging.FromContext(ctx).With(zap.String("component", "outbox"))
+					logger := logctx.FromOr(ctx, b.log).With(observability.F("event", name))
 					logger.Error("event_handler_panic",
-						zap.String("event", name),
-						zap.Any("panic", r),
-						zap.String("stack", string(debug.Stack())),
+						observability.F("event", name),
+						observability.F("panic", r),
+						observability.F("stack", string(debug.Stack())),
 					)
 				}
 				<-sem
 				wg.Done()
 			}()
 
-			hctx, cancel := context.WithTimeout(bg, 30*time.Second)
-			err := h(hctx, e)
+			ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+			ctx = logctx.With(ctx, baseLogger.With(observability.F("event", name)))
+			err := h(ctx, e)
 			cancel()
 			if err != nil {
-				logger := logging.FromContext(ctx).With(zap.String("component", "outbox"))
-				logger.Warn("event_handler_error",
-					zap.String("event", name),
-					zap.Error(err),
+				baseLogger.Warn("event_handler_error",
+					observability.F("error", err),
 				)
 			}
 		}()
@@ -158,9 +149,8 @@ func (b *Bus) fanout(ctx context.Context, e Event) {
 
 	wg.Wait()
 
-	logger := logging.FromContext(ctx).With(zap.String("component", "outbox"))
-	logger.Debug("event_fanned_out",
-		zap.String("event", name),
-		zap.Int("handlers", len(handlers)),
+	baseLogger.Debug("event_fanned_out",
+		observability.F("event", name),
+		observability.F("handlers", len(handlers)),
 	)
 }

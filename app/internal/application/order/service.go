@@ -7,23 +7,19 @@ import (
 	"time"
 
 	domain "github.com/Zhima-Mochi/minishop-observability/app/internal/domain/order"
-	"github.com/Zhima-Mochi/minishop-observability/app/internal/infrastructure/outbox"
-	"github.com/Zhima-Mochi/minishop-observability/app/internal/pkg/logging"
+	domoutbox "github.com/Zhima-Mochi/minishop-observability/app/internal/domain/outbox"
+	"github.com/Zhima-Mochi/minishop-observability/app/internal/observability"
+	"github.com/Zhima-Mochi/minishop-observability/app/internal/observability/logctx"
 
-	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
-	"go.uber.org/zap"
-
-	prometheus "github.com/prometheus/client_golang/prometheus"
 )
 
 const (
-	componentOrderService = "order_service"
-	useCaseOrderCreate    = "order.create"
-	tracerName            = "minishop.order"
-	spanPrefix            = "UC."
+	orderService       = "order-service"
+	useCaseOrderCreate = "order.create"
+	spanPrefix         = "UC."
 )
 
 var (
@@ -35,18 +31,37 @@ var (
 type Service struct {
 	repo        domain.Repository
 	idGenerator IDGenerator
-	publisher   outbox.Publisher
+	publisher   domoutbox.Publisher
+	tel         observability.Telemetry
+
+	// Base logger with fixed fields prebound (vendor must remain hidden).
+	log observability.Logger
+	// RED metrics (supplied via DI; do not instantiate inside methods).
+	reqCounter   observability.Counter   // usecase_requests_total{use_case,outcome}
+	durHistogram observability.Histogram // usecase_duration_seconds{use_case}
 }
 
 func NewService(
 	repo domain.Repository,
 	idGen IDGenerator,
-	publisher outbox.Publisher,
+	publisher domoutbox.Publisher,
+	tel observability.Telemetry,
 ) *Service {
+	baseLog := tel.Logger().With(
+		observability.F("service", orderService),
+	)
+
+	req := tel.Counter("usecase_requests_total")
+	dur := tel.Histogram("usecase_duration_seconds")
+
 	return &Service{
-		repo:        repo,
-		idGenerator: idGen,
-		publisher:   publisher,
+		repo:         repo,
+		idGenerator:  idGen,
+		publisher:    publisher,
+		tel:          tel,
+		log:          baseLog,
+		reqCounter:   req,
+		durHistogram: dur,
 	}
 }
 
@@ -57,61 +72,77 @@ type CreateOrderInput struct {
 	Quantity       int
 	Amount         int64
 }
-
 type CreateOrderResult struct {
 	OrderID string
 	Status  domain.Status
 }
 
 func (s *Service) CreateOrder(ctx context.Context, input CreateOrderInput) (_ *CreateOrderResult, err error) {
-	ctx, span := s.startSpan(ctx)
-	defer span.End()
+	logger := logctx.FromOr(ctx, s.log).With(observability.F("use_case", useCaseOrderCreate))
 
-	logger := logging.FromContext(ctx).With(zap.String("use_case", useCaseOrderCreate))
-
+	// sub span (server span in HTTP middleware)
+	ctx, span := s.tel.Tracer().Start(ctx, spanPrefix+"CreateOrder",
+		attribute.String("use_case", useCaseOrderCreate),
+	)
 	start := time.Now()
-	statusText := "OK"
+	outcome, statusText := "success", "OK"
+	var orderID string
 
 	defer func() {
-		duration := time.Since(start)
-		reqs := prometheus.NewCounterVec(prometheus.CounterOpts{}, []string{"use_case", "status"})
-		dur := prometheus.NewHistogramVec(prometheus.HistogramOpts{}, []string{"use_case", "status"})
+		lat := time.Since(start).Seconds()
 
+		// RED
+		if s.reqCounter != nil {
+			s.reqCounter.Add(1, observability.L("use_case", useCaseOrderCreate), observability.L("outcome", outcome))
+		}
+		if s.durHistogram != nil {
+			s.durHistogram.Observe(lat, observability.L("use_case", useCaseOrderCreate))
+		}
+
+		// One semantic log
+		fields := []observability.Field{
+			observability.F("outcome", outcome),
+			observability.F("status", statusText),
+			observability.F("latency_seconds", lat),
+		}
+		if orderID != "" {
+			fields = append(fields, observability.F("order_id", orderID))
+		}
 		if err != nil {
+			fields = append(fields, observability.F("error", err.Error()))
 			span.RecordError(err)
 			span.SetStatus(codes.Error, statusText)
 		} else {
 			span.SetStatus(codes.Ok, statusText)
 		}
+		logger.Info("use_case_done", fields...)
 
-		reqs.WithLabelValues(useCaseOrderCreate, statusText).Inc()
-		dur.WithLabelValues(useCaseOrderCreate, statusText).Observe(duration.Seconds())
-
-		logger.Info("use_case_done", zap.String("use_case", useCaseOrderCreate), zap.String("status", statusText))
+		span.End()
 	}()
 
+	// validation
 	if input.CustomerID == "" {
-		statusText = "CUSTOMER_ID_REQUIRED"
+		outcome, statusText = "error", "CUSTOMER_ID_REQUIRED"
 		return nil, newValidation("customer id is required")
 	}
 	if input.ProductID == "" {
-		statusText = "PRODUCT_ID_REQUIRED"
+		outcome, statusText = "error", "PRODUCT_ID_REQUIRED"
 		return nil, newValidation("product id is required")
 	}
 	if input.Quantity <= 0 {
-		statusText = "QUANTITY_INVALID"
+		outcome, statusText = "error", "QUANTITY_INVALID"
 		return nil, newValidation("quantity must be greater than zero")
 	}
 	if input.Amount <= 0 {
-		statusText = "AMOUNT_INVALID"
+		outcome, statusText = "error", "AMOUNT_INVALID"
 		return nil, newValidation("amount must be greater than zero")
 	}
-
 	if err := ctx.Err(); err != nil {
-		statusText = "CONTEXT_CANCELED"
+		outcome, statusText = "error", "CONTEXT_CANCELED"
 		return nil, err
 	}
 
+	// idempotency
 	if input.IdempotencyKey != "" {
 		existing, repoErr := s.repo.FindByIdempotency(ctx, input.CustomerID, input.IdempotencyKey)
 		switch {
@@ -121,30 +152,26 @@ func (s *Service) CreateOrder(ctx context.Context, input CreateOrderInput) (_ *C
 			span.AddEvent("order.idempotent_replay",
 				trace.WithAttributes(attribute.String("order.id", existing.ID)),
 			)
-			return &CreateOrderResult{
-				OrderID: existing.ID,
-				Status:  existing.Status,
-			}, nil
+			return &CreateOrderResult{OrderID: existing.ID, Status: existing.Status}, nil
 		case errors.Is(repoErr, domain.ErrNotFound):
-			// proceed to create a new order
+			// go on
 		default:
-			statusText = "IDEMPOTENCY_LOOKUP_FAILED"
+			outcome, statusText = "error", "IDEMPOTENCY_LOOKUP_FAILED"
 			return nil, wrapRepositoryError(repoErr)
 		}
 	}
 
-	generatedID := s.idGenerator.NewID()
-	entity, domainErr := domain.New(generatedID, input.CustomerID, input.ProductID, input.IdempotencyKey, input.Quantity, input.Amount)
-	if domainErr != nil {
-		statusText = "DOMAIN_CONSTRUCTION_FAILED"
-		return nil, fmt.Errorf("order: construct: %w", domainErr)
+	// construction
+	orderID = s.idGenerator.NewID()
+	entity, derr := domain.New(orderID, input.CustomerID, input.ProductID, input.IdempotencyKey, input.Quantity, input.Amount)
+	if derr != nil {
+		outcome, statusText = "error", "DOMAIN_CONSTRUCTION_FAILED"
+		return nil, fmt.Errorf("order: construct: %w", derr)
 	}
-
 	if err := ctx.Err(); err != nil {
-		statusText = "CONTEXT_CANCELED"
+		outcome, statusText = "error", "CONTEXT_CANCELED"
 		return nil, err
 	}
-
 	if err := s.repo.Insert(ctx, entity); err != nil {
 		if errors.Is(err, domain.ErrConflict) && input.IdempotencyKey != "" {
 			if existing, lookupErr := s.repo.FindByIdempotency(ctx, input.CustomerID, input.IdempotencyKey); lookupErr == nil {
@@ -153,39 +180,32 @@ func (s *Service) CreateOrder(ctx context.Context, input CreateOrderInput) (_ *C
 				span.AddEvent("order.idempotent_replay",
 					trace.WithAttributes(attribute.String("order.id", existing.ID)),
 				)
-				return &CreateOrderResult{
-					OrderID: existing.ID,
-					Status:  existing.Status,
-				}, nil
+				return &CreateOrderResult{OrderID: existing.ID, Status: existing.Status}, nil
 			}
 		}
-		statusText = "REPO_INSERT_FAILED"
+		outcome, statusText = "error", "REPO_INSERT_FAILED"
 		return nil, wrapRepositoryError(err)
 	}
 
-	evt := domain.NewOrderCreatedEvent(entity)
-	if err := s.publisher.Publish(ctx, evt); err != nil {
-		span.RecordError(err)
-		span.SetStatus(codes.Error, "EVENT_PUBLISH_FAILED")
-		statusText = "EVENT_PUBLISH_FAILED"
-		logger.Warn("event_publish_failed",
-			zap.String("event", evt.EventName()),
-			zap.String("order_id", entity.ID),
-			zap.Error(err),
-		)
+	// publish event (best-effort; don't block tail)
+	if s.publisher != nil {
+		if pubErr := s.publisher.Publish(ctx, domain.NewOrderCreatedEvent(entity)); pubErr != nil {
+			outcome, statusText = "success", "EVENT_PUBLISH_FAILED"
+			logger.Warn("event_publish_failed",
+				observability.F("event", "order.created"),
+				observability.F("order_id", entity.ID),
+				observability.F("error", pubErr.Error()),
+			)
+		}
 	}
 
 	span.SetAttributes(attribute.String("order.status", string(entity.Status)))
-	span.AddEvent("order.created",
-		trace.WithAttributes(attribute.String("order.id", entity.ID)),
-	)
+	span.AddEvent("order.created", trace.WithAttributes(attribute.String("order.id", entity.ID)))
 
-	return &CreateOrderResult{
-		OrderID: entity.ID,
-		Status:  entity.Status,
-	}, nil
+	return &CreateOrderResult{OrderID: entity.ID, Status: entity.Status}, nil
 }
 
+// Get: keep it simple
 func (s *Service) Get(ctx context.Context, id string) (*domain.Order, error) {
 	if id == "" {
 		return nil, newValidation("order id is required")
@@ -193,42 +213,20 @@ func (s *Service) Get(ctx context.Context, id string) (*domain.Order, error) {
 	return s.repo.Get(ctx, id)
 }
 
-func (s *Service) startSpan(ctx context.Context) (context.Context, trace.Span) {
-	return otel.Tracer(tracerName).Start(ctx, spanPrefix+"CreateOrder",
-		trace.WithSpanKind(trace.SpanKindServer),
-		trace.WithAttributes(
-			attribute.String("use_case", useCaseOrderCreate),
-		),
-	)
-}
-
-type validationError struct {
-	msg string
-}
-
-func (e validationError) Error() string {
-	return e.msg
-}
-
-func newValidation(msg string) error {
-	return validationError{msg: fmt.Sprintf("order: %s", msg)}
-}
-
-// IsValidation reports whether the provided error is a validation error emitted by the order use case.
-func IsValidation(err error) bool {
-	var v validationError
-	return errors.As(err, &v)
-}
-
 func wrapRepositoryError(err error) error {
 	if err == nil {
 		return nil
 	}
-	if errors.Is(err, domain.ErrNotFound) {
+	switch {
+	case errors.Is(err, domain.ErrNotFound):
 		return ErrNotFound
-	}
-	if errors.Is(err, domain.ErrConflict) {
+	case errors.Is(err, domain.ErrConflict):
 		return ErrConflict
+	default:
+		return fmt.Errorf("%w: %w", ErrRepository, err)
 	}
-	return fmt.Errorf("%w: %v", ErrRepository, err)
+}
+
+func newValidation(msg string) error {
+	return fmt.Errorf("validation: %w", errors.New(msg))
 }
