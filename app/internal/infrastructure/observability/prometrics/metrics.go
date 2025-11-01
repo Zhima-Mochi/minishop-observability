@@ -30,10 +30,42 @@ func (c *counter) Add(d float64, labels ...observability.Label) {
 	c.v.With(labelMap(labels)).Add(d)
 }
 
+func (c *counter) Bind(labels ...observability.Label) observability.BoundCounter {
+	return &boundCounter{v: c.v, labels: labelMap(labels)}
+}
+
+type boundCounter struct {
+	v      *prometheus.CounterVec
+	labels prometheus.Labels
+}
+
+func (c *boundCounter) Add(d float64) {
+	if c == nil || c.v == nil {
+		return
+	}
+	c.v.With(c.labels).Add(d)
+}
+
 type histogram struct{ v *prometheus.HistogramVec }
 
 func (h *histogram) Observe(v float64, labels ...observability.Label) {
 	h.v.With(labelMap(labels)).Observe(v)
+}
+
+func (h *histogram) Bind(labels ...observability.Label) observability.BoundHistogram {
+	return &boundHistogram{v: h.v, labels: labelMap(labels)}
+}
+
+type boundHistogram struct {
+	v      *prometheus.HistogramVec
+	labels prometheus.Labels
+}
+
+func (h *boundHistogram) Observe(v float64) {
+	if h == nil || h.v == nil {
+		return
+	}
+	h.v.With(h.labels).Observe(v)
 }
 
 func labelMap(ls []observability.Label) prometheus.Labels {

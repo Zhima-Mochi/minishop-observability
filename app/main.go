@@ -14,12 +14,12 @@ import (
 	appPayment "github.com/Zhima-Mochi/minishop-observability/app/internal/application/payment"
 	"github.com/Zhima-Mochi/minishop-observability/app/internal/infrastructure/id"
 	"github.com/Zhima-Mochi/minishop-observability/app/internal/infrastructure/memory"
+	obsprovider "github.com/Zhima-Mochi/minishop-observability/app/internal/infrastructure/observability"
 	"github.com/Zhima-Mochi/minishop-observability/app/internal/infrastructure/observability/oteltrace"
 	"github.com/Zhima-Mochi/minishop-observability/app/internal/infrastructure/observability/prometrics"
-	"github.com/Zhima-Mochi/minishop-observability/app/internal/infrastructure/observability/telemetry"
 	"github.com/Zhima-Mochi/minishop-observability/app/internal/infrastructure/observability/zaplogger"
 	"github.com/Zhima-Mochi/minishop-observability/app/internal/infrastructure/outbox"
-	"github.com/Zhima-Mochi/minishop-observability/app/internal/observability"
+	coreobservability "github.com/Zhima-Mochi/minishop-observability/app/internal/observability"
 	httppresentation "github.com/Zhima-Mochi/minishop-observability/app/internal/presentation/http"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -30,8 +30,8 @@ func main() {
 	env := getenvDefault("ENV", "dev")
 
 	baseLogger := zaplogger.New(
-		observability.F("service", serviceName),
-		observability.F("env", env),
+		coreobservability.F("service", serviceName),
+		coreobservability.F("env", env),
 	)
 	if syncer, ok := baseLogger.(interface{ Sync() error }); ok {
 		defer func() { _ = syncer.Sync() }()
@@ -39,38 +39,51 @@ func main() {
 
 	metrics := prometrics.New(serviceName, "app")
 	usecaseRequests := metrics.Counter(
-		"usecase_requests_total",
+		string(coreobservability.MUsecaseRequests),
 		"Total number of use case invocations.",
 		"use_case", "outcome",
 	)
 	usecaseDurations := metrics.Histogram(
-		"usecase_duration_seconds",
+		string(coreobservability.MUsecaseDuration),
 		"Duration of use case execution in seconds.",
 		prometheus.DefBuckets,
 		"use_case",
 	)
 	httpRequests := metrics.Counter(
-		"http_requests_total",
+		string(coreobservability.MHTTPRequests),
 		"Total number of HTTP requests.",
 		"method", "route", "status",
 	)
 	httpDurations := metrics.Histogram(
-		"http_request_duration_seconds",
+		string(coreobservability.MHTTPRequestDuration),
 		"Duration of HTTP request handling in seconds.",
 		prometheus.DefBuckets,
 		"method", "route", "status",
 	)
+	externalRequests := metrics.Counter(
+		string(coreobservability.MExternalRequests),
+		"Total number of outbound requests made by the service.",
+		"peer", "endpoint", "outcome",
+	)
+	externalDurations := metrics.Histogram(
+		string(coreobservability.MExternalRequestDuration),
+		"Duration of outbound requests in seconds.",
+		prometheus.DefBuckets,
+		"peer", "endpoint",
+	)
 
-	tel := telemetry.New(
+	tel := obsprovider.New(
 		oteltrace.New(serviceName),
 		baseLogger,
-		map[string]observability.Counter{
-			"usecase_requests_total": usecaseRequests,
-			"http_requests_total":    httpRequests,
+		map[coreobservability.MetricKey]coreobservability.Counter{
+			coreobservability.MUsecaseRequests:  usecaseRequests,
+			coreobservability.MHTTPRequests:     httpRequests,
+			coreobservability.MExternalRequests: externalRequests,
 		},
-		map[string]observability.Histogram{
-			"usecase_duration_seconds":      usecaseDurations,
-			"http_request_duration_seconds": httpDurations,
+		map[coreobservability.MetricKey]coreobservability.Histogram{
+			coreobservability.MUsecaseDuration:         usecaseDurations,
+			coreobservability.MHTTPRequestDuration:     httpDurations,
+			coreobservability.MExternalRequestDuration: externalDurations,
 		},
 	)
 
@@ -83,19 +96,19 @@ func main() {
 	bus.Start(context.Background())
 	defer bus.Stop(context.Background())
 
-	// Order service publishes events instead of mutating other contexts directly
-	orderService := appOrder.NewService(orderRepo, idGenerator, bus, tel)
-	paymentService := appPayment.NewService(orderRepo, tel)
+	// Order use case publishes events instead of mutating other contexts directly
+	orderUseCase := appOrder.NewCreateOrderUseCase(orderRepo, idGenerator, bus, tel)
+	paymentUseCase := appPayment.NewProcessPaymentUseCase(orderRepo, tel)
 
-	inventoryService := appInventory.NewService(inventoryRepo, bus, tel)
-	inventoryWorker := appInventory.New(bus, inventoryService, tel, baseLogger)
+	inventoryUseCase := appInventory.NewReserveInventoryUseCase(inventoryRepo, bus, tel)
+	inventoryWorker := appInventory.New(bus, inventoryUseCase, tel, baseLogger)
 	orderWorker := appOrder.New(orderRepo, bus, bus, tel, baseLogger)
-	paymentWorker := appPayment.New(bus, paymentService, tel)
+	paymentWorker := appPayment.New(bus, paymentUseCase, tel)
 
 	inventoryWorker.Start()
 	orderWorker.Start()
 	paymentWorker.Start()
-	handler := httppresentation.NewHandler(orderService, paymentService, baseLogger, tel)
+	handler := httppresentation.NewHandler(orderUseCase, paymentUseCase, baseLogger, tel)
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.Handler())
 	mux.Handle("/", handler.Router())
@@ -106,7 +119,7 @@ func main() {
 	}
 
 	systemLogger := tel.Logger().With(
-		observability.F("component", "system"),
+		coreobservability.F("component", "system"),
 	)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -114,12 +127,12 @@ func main() {
 
 	go func() {
 		systemLogger.Info("http_server_start",
-			observability.F("addr", server.Addr),
+			coreobservability.F("addr", server.Addr),
 		)
 		err := server.ListenAndServe()
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {
 			systemLogger.Error("http_server_error",
-				observability.F("error", err),
+				coreobservability.F("error", err),
 			)
 		}
 	}()
@@ -131,7 +144,7 @@ func main() {
 
 	if err := server.Shutdown(shutdownCtx); err != nil {
 		systemLogger.Error("http_server_shutdown_error",
-			observability.F("error", err),
+			coreobservability.F("error", err),
 		)
 	} else {
 		systemLogger.Info("http_server_stopped")

@@ -22,13 +22,13 @@ type Bus struct {
 	cancel      context.CancelFunc
 	concurrency int
 	log         observability.Logger
-	tel         observability.Telemetry
+	tel         observability.Observability
 }
 
 // NewBus creates a bus with a buffered queue and a concurrency cap.
 const componentOutbox = "outbox"
 
-func NewBus(logger observability.Logger, tel observability.Telemetry) *Bus {
+func NewBus(logger observability.Logger, tel observability.Observability) *Bus {
 	return &Bus{
 		subs:        make(map[string][]domoutbox.Handler),
 		queue:       make(chan domoutbox.Event, 1024), // buffer for backpressure

@@ -22,12 +22,23 @@ func ObservabilityMiddleware(
 	base observability.Logger,
 	requestID func(*http.Request) string,
 	tenantID func(*http.Request) string,
-	tel observability.Telemetry,
+	tel observability.Observability,
 ) func(http.Handler) http.Handler {
 	if base == nil {
-		base = tel.Logger()
+		if tel != nil {
+			base = tel.Logger()
+		} else {
+			base = observability.NopLogger()
+		}
 	}
 	prop := otel.GetTextMapPropagator() // W3C by default
+	reqCounter := observability.NopCounter()
+	reqHistogram := observability.NopHistogram()
+	if tel != nil {
+		metrics := tel.Metrics()
+		reqCounter = metrics.Counter(observability.MHTTPRequests)
+		reqHistogram = metrics.Histogram(observability.MHTTPRequestDuration)
+	}
 
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -71,12 +82,16 @@ func ObservabilityMiddleware(
 			route := routeFromContext(ctx)             // low-cardinality template you set earlier
 			statusLabel := http.StatusText(lrw.status) // or strconv.Itoa(lrw.status)
 
-			if tel != nil {
-				tel.Counter("http_requests_total").Add(1, observability.L("method", r.Method), observability.L("route", route), observability.L("status", statusLabel))
-			}
-			if tel != nil {
-				tel.Histogram("http_request_duration_seconds").Observe(time.Since(start).Seconds(), observability.L("method", r.Method), observability.L("route", route), observability.L("status", statusLabel))
-			}
+			reqCounter.Add(1,
+				observability.L("method", r.Method),
+				observability.L("route", route),
+				observability.L("status", statusLabel),
+			)
+			reqHistogram.Observe(time.Since(start).Seconds(),
+				observability.L("method", r.Method),
+				observability.L("route", route),
+				observability.L("status", statusLabel),
+			)
 		})
 	}
 }

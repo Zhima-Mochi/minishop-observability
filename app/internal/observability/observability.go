@@ -7,17 +7,39 @@ import (
 	"go.opentelemetry.io/otel/trace"
 )
 
-// TraceCtx is a thin wrapper to start spans without binding to a concrete tracer.
-type TraceCtx interface {
+type Observability interface {
+	Tracer() Tracer
+	Logger() Logger
+	Metrics() Metrics
+}
+
+type Metrics interface {
+	Counter(name MetricKey) Counter
+	Histogram(name MetricKey) Histogram
+}
+
+// Tracer is a thin wrapper to start spans.
+type Tracer interface {
 	Start(ctx context.Context, name string, attrs ...attribute.KeyValue) (context.Context, trace.Span)
 }
 
-// Minimal metric ports; hide prometheus types behind interfaces.
+// Counter is a thin wrapper to add metrics.
 type Counter interface {
 	Add(delta float64, labels ...Label)
+	Bind(labels ...Label) BoundCounter
 }
+
+type BoundCounter interface {
+	Add(delta float64)
+}
+
 type Histogram interface {
 	Observe(value float64, labels ...Label)
+	Bind(labels ...Label) BoundHistogram
+}
+
+type BoundHistogram interface {
+	Observe(value float64)
 }
 
 type Label struct{ Key, Value string }
@@ -31,7 +53,7 @@ type Field struct {
 
 func F(k string, v any) Field { return Field{Key: k, Value: v} }
 
-// Logger interface
+// Logger is a thin wrapper to log messages.
 type Logger interface {
 	With(fields ...Field) Logger
 	Debug(msg string, fields ...Field)
@@ -40,9 +62,4 @@ type Logger interface {
 	Error(msg string, fields ...Field)
 }
 
-type Telemetry interface {
-	Tracer() TraceCtx
-	Counter(name string) Counter
-	Histogram(name string) Histogram
-	Logger() Logger
-}
+type MetricKey string

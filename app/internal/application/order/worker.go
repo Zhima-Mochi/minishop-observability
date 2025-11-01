@@ -20,31 +20,42 @@ type Worker struct {
 	repo       domorder.Repository
 	subscriber domoutbox.Subscriber
 	publisher  domoutbox.Publisher
-	tel        observability.Telemetry
+	tel        observability.Observability
 
 	log          observability.Logger
 	reqCounter   observability.Counter   // usecase_requests_total{use_case,outcome}
 	durHistogram observability.Histogram // usecase_duration_seconds{use_case}
+	extCounter   observability.Counter   // external_requests_total{peer,endpoint,outcome}
+	extHistogram observability.Histogram // external_request_duration_seconds{peer,endpoint}
 }
 
 const (
-	workerService = "order-worker"
+	workerService       = "order-worker"
+	endpointInvReserved = "order.inventory_reserved"
+	endpointInvFailed   = "order.inventory_reservation_failed"
 )
 
 func New(
 	repo domorder.Repository,
 	subscriber domoutbox.Subscriber,
 	publisher domoutbox.Publisher,
-	tel observability.Telemetry,
+	tel observability.Observability,
 	logger observability.Logger,
 ) *Worker {
 	base := logger
-	if base == nil {
+	if base == nil && tel != nil {
 		base = tel.Logger()
+	}
+	if base == nil {
+		base = observability.NopLogger()
 	}
 	base = base.With(
 		observability.F("service", workerService),
 	)
+	metricsProvider := observability.NopMetrics()
+	if tel != nil {
+		metricsProvider = tel.Metrics()
+	}
 
 	return &Worker{
 		repo:         repo,
@@ -52,8 +63,10 @@ func New(
 		publisher:    publisher,
 		tel:          tel,
 		log:          base,
-		reqCounter:   tel.Counter("usecase_requests_total"),
-		durHistogram: tel.Histogram("usecase_duration_seconds"),
+		reqCounter:   metricsProvider.Counter(observability.MUsecaseRequests),
+		durHistogram: metricsProvider.Histogram(observability.MUsecaseDuration),
+		extCounter:   metricsProvider.Counter(observability.MExternalRequests),
+		extHistogram: metricsProvider.Histogram(observability.MExternalRequestDuration),
 	}
 }
 
@@ -65,7 +78,7 @@ func (w *Worker) Start() {
 	w.subscriber.Subscribe(dominventory.InventoryReservationFailedEvent{}.EventName(), w.handleInventoryReservationFailed)
 }
 
-func (w *Worker) handleInventoryReserved(ctx context.Context, e domoutbox.Event) error {
+func (w *Worker) handleInventoryReserved(ctx context.Context, e domoutbox.Event) (err error) {
 	const useCase = "order.worker.inventory_reserved"
 	evt, ok := e.(dominventory.InventoryReservedEvent)
 	if !ok {
@@ -76,10 +89,11 @@ func (w *Worker) handleInventoryReserved(ctx context.Context, e domoutbox.Event)
 	ctx, span := w.tel.Tracer().Start(ctx, spanPrefix+"InventoryReserved",
 		attribute.String("use_case", useCase),
 		attribute.String("event", e.EventName()),
+		attribute.String("order.id", evt.OrderID),
 	)
 	start := time.Now()
 	outcome, status := "success", "OK"
-	var orderID string
+	var publishErr error
 
 	logger := logctx.From(ctx)
 	if logger == nil {
@@ -88,6 +102,7 @@ func (w *Worker) handleInventoryReserved(ctx context.Context, e domoutbox.Event)
 	logger = logger.With(
 		observability.F("use_case", useCase),
 		observability.F("event", e.EventName()),
+		observability.F("order_id", evt.OrderID),
 	)
 	if sc := trace.SpanContextFromContext(ctx); sc.IsValid() {
 		logger = logger.With(
@@ -95,72 +110,65 @@ func (w *Worker) handleInventoryReserved(ctx context.Context, e domoutbox.Event)
 			observability.F("span_id", sc.SpanID().String()),
 		)
 	}
-	// pass logger back to ctx, so downstream repo/client can also fetch same logger
 	ctx = logctx.With(ctx, logger)
 
 	defer func() {
 		lat := time.Since(start).Seconds()
 		w.observe(useCase, outcome, lat)
 
+		if span != nil {
+			if err != nil {
+				span.RecordError(err)
+				span.SetStatus(codes.Error, status)
+			} else {
+				span.SetStatus(codes.Ok, status)
+			}
+			if publishErr != nil {
+				span.RecordError(publishErr)
+			}
+			span.End()
+		}
+
 		fields := []observability.Field{
 			observability.F("outcome", outcome),
 			observability.F("status", status),
 			observability.F("latency_seconds", lat),
+			observability.F("order_id", evt.OrderID),
 		}
-		if orderID != "" {
-			fields = append(fields, observability.F("order_id", orderID))
+		if publishErr != nil {
+			fields = append(fields, observability.F("event_publish_error", publishErr.Error()))
+		}
+		if err != nil {
+			fields = append(fields, observability.F("error", err.Error()))
 		}
 		logger.Info("use_case_done", fields...)
-
-		if outcome == "error" {
-			span.SetStatus(codes.Error, status)
-		} else {
-			span.SetStatus(codes.Ok, status)
-		}
-		span.End()
 	}()
 
-	order, err := w.repo.Get(ctx, evt.OrderID)
-	if err != nil {
+	order, loadErr := w.repo.Get(ctx, evt.OrderID)
+	if loadErr != nil {
 		outcome, status = "error", "ORDER_LOAD_FAILED"
-		return fmt.Errorf("worker: load order: %w", err)
+		return fmt.Errorf("worker: load order: %w", loadErr)
 	}
-	orderID = order.ID
 
-	if err := order.InventoryReserved(); err != nil {
+	if transErr := order.InventoryReserved(); transErr != nil {
 		outcome, status = "error", "STATE_TRANSITION_FAILED"
-		return fmt.Errorf("worker: inventory reserved transition: %w", err)
+		return fmt.Errorf("worker: inventory reserved transition: %w", transErr)
 	}
 
-	if err := w.repo.Update(ctx, order); err != nil {
+	if updateErr := w.repo.Update(ctx, order); updateErr != nil {
 		outcome, status = "error", "ORDER_UPDATE_FAILED"
-		return fmt.Errorf("worker: update order: %w", err)
+		return fmt.Errorf("worker: update order: %w", updateErr)
 	}
 
-	// publish event (best-effort; don't block tail)
-	if w.publisher != nil {
-		ctxPub, cancel := context.WithTimeout(ctx, 300*time.Millisecond)
-		defer cancel()
-		if err := w.publisher.Publish(ctxPub, domorder.NewOrderInventoryReservedEvent(order)); err != nil {
-			// still success, but record in trace
-			span.RecordError(err)
-			status = "EVENT_PUBLISH_FAILED"
-			logger.Warn("event_publish_failed",
-				observability.F("event", "order.inventory_reserved"),
-				observability.F("order_id", order.ID),
-				observability.F("error", err.Error()),
-			)
-		}
+	publishErr = w.publish(ctx, endpointInvReserved, domorder.NewOrderInventoryReservedEvent(order))
+	if publishErr != nil {
+		status = "EVENT_PUBLISH_FAILED"
 	}
 
-	span.SetAttributes(
-		attribute.String("order.id", order.ID),
-		attribute.String("event", e.EventName()),
-	)
 	return nil
 }
 
-func (w *Worker) handleInventoryReservationFailed(ctx context.Context, e domoutbox.Event) error {
+func (w *Worker) handleInventoryReservationFailed(ctx context.Context, e domoutbox.Event) (err error) {
 	const useCase = "order.worker.inventory_reservation_failed"
 	evt, ok := e.(dominventory.InventoryReservationFailedEvent)
 	if !ok {
@@ -171,10 +179,12 @@ func (w *Worker) handleInventoryReservationFailed(ctx context.Context, e domoutb
 	ctx, span := w.tel.Tracer().Start(ctx, spanPrefix+"InventoryReservationFailed",
 		attribute.String("use_case", useCase),
 		attribute.String("event", e.EventName()),
+		attribute.String("order.id", evt.OrderID),
+		attribute.String("failure.reason", evt.Reason),
 	)
 	start := time.Now()
 	outcome, status := "success", "OK"
-	var orderID string
+	var publishErr error
 
 	logger := logctx.From(ctx)
 	if logger == nil {
@@ -183,6 +193,7 @@ func (w *Worker) handleInventoryReservationFailed(ctx context.Context, e domoutb
 	logger = logger.With(
 		observability.F("use_case", useCase),
 		observability.F("event", e.EventName()),
+		observability.F("order_id", evt.OrderID),
 	)
 	if sc := trace.SpanContextFromContext(ctx); sc.IsValid() {
 		logger = logger.With(
@@ -196,63 +207,58 @@ func (w *Worker) handleInventoryReservationFailed(ctx context.Context, e domoutb
 		lat := time.Since(start).Seconds()
 		w.observe(useCase, outcome, lat)
 
+		if span != nil {
+			if err != nil {
+				span.RecordError(err)
+				span.SetStatus(codes.Error, status)
+			} else {
+				span.SetStatus(codes.Ok, status)
+			}
+			if publishErr != nil {
+				span.RecordError(publishErr)
+			}
+			span.End()
+		}
+
 		fields := []observability.Field{
 			observability.F("outcome", outcome),
 			observability.F("status", status),
 			observability.F("latency_seconds", lat),
-		}
-		if orderID != "" {
-			fields = append(fields, observability.F("order_id", orderID))
+			observability.F("order_id", evt.OrderID),
 		}
 		if evt.Reason != "" {
-			fields = append(fields, observability.F("reason", evt.Reason))
+			fields = append(fields, observability.F("failure_reason", evt.Reason))
+		}
+		if publishErr != nil {
+			fields = append(fields, observability.F("event_publish_error", publishErr.Error()))
+		}
+		if err != nil {
+			fields = append(fields, observability.F("error", err.Error()))
 		}
 		logger.Info("use_case_done", fields...)
-
-		if outcome == "error" {
-			span.SetStatus(codes.Error, status)
-		} else {
-			span.SetStatus(codes.Ok, status)
-		}
-		span.End()
 	}()
 
-	order, err := w.repo.Get(ctx, evt.OrderID)
-	if err != nil {
+	order, loadErr := w.repo.Get(ctx, evt.OrderID)
+	if loadErr != nil {
 		outcome, status = "error", "ORDER_LOAD_FAILED"
-		return fmt.Errorf("worker: load order: %w", err)
+		return fmt.Errorf("worker: load order: %w", loadErr)
 	}
-	orderID = order.ID
 
-	if err := order.InventoryReservationFailed(evt.Reason); err != nil {
+	if transErr := order.InventoryReservationFailed(evt.Reason); transErr != nil {
 		outcome, status = "error", "STATE_TRANSITION_FAILED"
-		return fmt.Errorf("worker: reservation failed transition: %w", err)
+		return fmt.Errorf("worker: inventory reservation failed transition: %w", transErr)
 	}
 
-	if err := w.repo.Update(ctx, order); err != nil {
+	if updateErr := w.repo.Update(ctx, order); updateErr != nil {
 		outcome, status = "error", "ORDER_UPDATE_FAILED"
-		return fmt.Errorf("worker: update order: %w", err)
+		return fmt.Errorf("worker: update order: %w", updateErr)
 	}
 
-	if w.publisher != nil {
-		ctxPub, cancel := context.WithTimeout(ctx, 300*time.Millisecond)
-		defer cancel()
-		if err := w.publisher.Publish(ctxPub, domorder.NewOrderInventoryReservationFailedEvent(order, evt.Reason)); err != nil {
-			span.RecordError(err)
-			status = "EVENT_PUBLISH_FAILED"
-			logger.Warn("event_publish_failed",
-				observability.F("event", "order.inventory_reservation_failed"),
-				observability.F("order_id", order.ID),
-				observability.F("error", err.Error()),
-			)
-		}
+	publishErr = w.publish(ctx, endpointInvFailed, domorder.NewOrderInventoryReservationFailedEvent(order, evt.Reason))
+	if publishErr != nil {
+		status = "EVENT_PUBLISH_FAILED"
 	}
 
-	span.SetAttributes(
-		attribute.String("order.id", order.ID),
-		attribute.String("event", e.EventName()),
-		attribute.String("reason", evt.Reason),
-	)
 	return nil
 }
 
@@ -272,4 +278,38 @@ func (w *Worker) observe(useCase string, outcome string, latencySeconds float64)
 			observability.L("use_case", useCase),
 		)
 	}
+}
+
+func (w *Worker) publish(ctx context.Context, endpoint string, event domoutbox.Event) error {
+	if w.publisher == nil || event == nil {
+		return nil
+	}
+
+	pubCtx, cancel := context.WithTimeout(ctx, publishTimeout)
+	start := time.Now()
+	err := w.publisher.Publish(pubCtx, event)
+	outcome := "success"
+	if err != nil {
+		outcome = "error"
+	} else if pubCtx.Err() != nil {
+		outcome = "canceled"
+		err = pubCtx.Err()
+	}
+	cancel()
+
+	if w.extCounter != nil {
+		w.extCounter.Add(1,
+			observability.L("peer", publishPeer),
+			observability.L("endpoint", endpoint),
+			observability.L("outcome", outcome),
+		)
+	}
+	if w.extHistogram != nil {
+		w.extHistogram.Observe(time.Since(start).Seconds(),
+			observability.L("peer", publishPeer),
+			observability.L("endpoint", endpoint),
+		)
+	}
+
+	return err
 }

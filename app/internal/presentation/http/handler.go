@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Zhima-Mochi/minishop-observability/app/internal/application"
 	appOrder "github.com/Zhima-Mochi/minishop-observability/app/internal/application/order"
 	appPayment "github.com/Zhima-Mochi/minishop-observability/app/internal/application/payment"
 	domainInventory "github.com/Zhima-Mochi/minishop-observability/app/internal/domain/inventory"
@@ -23,10 +24,12 @@ import (
 )
 
 type Handler struct {
-	orderService   *appOrder.Service
-	paymentService *appPayment.Service
+	orderUseCase   application.UseCase[appOrder.CreateOrderInput, *appOrder.CreateOrderResult]
+	paymentUseCase application.UseCase[appPayment.ProcessPaymentInput, *appPayment.ProcessPaymentResult]
 	log            observability.Logger
-	tel            observability.Telemetry
+	tel            observability.Observability
+	httpCounter    observability.Counter
+	httpHistogram  observability.Histogram
 }
 
 const (
@@ -35,18 +38,27 @@ const (
 	headerTenantID       = "X-Tenant-ID"
 )
 
-func NewHandler(orderSvc *appOrder.Service, paymentSvc *appPayment.Service, logger observability.Logger,
-	tel observability.Telemetry,
+func NewHandler(
+	orderUC application.UseCase[appOrder.CreateOrderInput, *appOrder.CreateOrderResult],
+	paymentUC application.UseCase[appPayment.ProcessPaymentInput, *appPayment.ProcessPaymentResult],
+	logger observability.Logger,
+	tel observability.Observability,
 ) *Handler {
 	baseLogger := logger
 	if baseLogger == nil {
 		baseLogger = observability.NopLogger()
 	}
+	metricsProvider := observability.NopMetrics()
+	if tel != nil {
+		metricsProvider = tel.Metrics()
+	}
 	return &Handler{
-		orderService:   orderSvc,
-		paymentService: paymentSvc,
+		orderUseCase:   orderUC,
+		paymentUseCase: paymentUC,
 		log:            baseLogger.With(observability.F("component", componentHTTPHandler)),
 		tel:            tel,
+		httpCounter:    metricsProvider.Counter(observability.MHTTPRequests),
+		httpHistogram:  metricsProvider.Histogram(observability.MHTTPRequestDuration),
 	}
 }
 
@@ -114,7 +126,7 @@ func (h *Handler) handleCreateOrder(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	result, err := h.orderService.CreateOrder(r.Context(), appOrder.CreateOrderInput{
+	result, err := h.orderUseCase.Execute(r.Context(), appOrder.CreateOrderInput{
 		IdempotencyKey: req.IdempotencyKey,
 		CustomerID:     req.CustomerID,
 		ProductID:      req.ProductID,
@@ -149,7 +161,10 @@ func (h *Handler) handleProcessPayment(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	status, err := h.paymentService.ProcessPayment(r.Context(), req.OrderID, req.Amount)
+	res, err := h.paymentUseCase.Execute(r.Context(), appPayment.ProcessPaymentInput{
+		OrderID: req.OrderID,
+		Amount:  req.Amount,
+	})
 	if err != nil {
 		writeDomainError(w, err)
 		return
@@ -157,7 +172,7 @@ func (h *Handler) handleProcessPayment(w http.ResponseWriter, r *http.Request) {
 
 	writeJSON(w, http.StatusOK, processPaymentResponse{
 		OrderID: req.OrderID,
-		Status:  status,
+		Status:  res.Status,
 	})
 }
 
@@ -229,12 +244,18 @@ func (h *Handler) withHTTPMetrics(next http.Handler) http.Handler {
 
 		next.ServeHTTP(lrw, r)
 
-		if h.tel != nil {
-			h.tel.Counter("http_requests_total").Add(1, observability.L("method", r.Method), observability.L("route", routeFromContext(r.Context())), observability.L("status", strconv.Itoa(lrw.status)))
-		}
-		if h.tel != nil {
-			h.tel.Histogram("http_request_duration_seconds").Observe(time.Since(start).Seconds(), observability.L("method", r.Method), observability.L("route", routeFromContext(r.Context())), observability.L("status", strconv.Itoa(lrw.status)))
-		}
+		route := routeFromContext(r.Context())
+		statusLabel := strconv.Itoa(lrw.status)
+		h.httpCounter.Add(1,
+			observability.L("method", r.Method),
+			observability.L("route", route),
+			observability.L("status", statusLabel),
+		)
+		h.httpHistogram.Observe(time.Since(start).Seconds(),
+			observability.L("method", r.Method),
+			observability.L("route", route),
+			observability.L("status", statusLabel),
+		)
 	})
 }
 

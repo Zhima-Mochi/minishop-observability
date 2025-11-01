@@ -15,7 +15,7 @@ import (
 func WithEventContext(
 	ctx context.Context,
 	base observability.Logger,
-	tel observability.Telemetry,
+	tel observability.Observability,
 	traceID trace.TraceID,
 	spanID trace.SpanID,
 	attrs map[string]string, // keep this low-cardinality: event name, tenant, shard, queue, etc.

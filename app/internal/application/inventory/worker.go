@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/Zhima-Mochi/minishop-observability/app/internal/application"
 	domorder "github.com/Zhima-Mochi/minishop-observability/app/internal/domain/order"
 	domoutbox "github.com/Zhima-Mochi/minishop-observability/app/internal/domain/outbox"
 	"github.com/Zhima-Mochi/minishop-observability/app/internal/observability"
@@ -18,8 +19,8 @@ const workerService = "inventory_worker"
 
 type Worker struct {
 	subscriber domoutbox.Subscriber
-	service    *Service
-	tel        observability.Telemetry
+	useCase    application.UseCase[domorder.OrderCreatedEvent, *ReservationResult]
+	tel        observability.Observability
 
 	log          observability.Logger
 	reqCounter   observability.Counter   // usecase_requests_total{use_case,outcome}
@@ -28,26 +29,33 @@ type Worker struct {
 
 func New(
 	subscriber domoutbox.Subscriber,
-	service *Service,
-	tel observability.Telemetry,
+	useCase application.UseCase[domorder.OrderCreatedEvent, *ReservationResult],
+	tel observability.Observability,
 	logger observability.Logger,
 ) *Worker {
 	baseLogger := logger
-	if baseLogger == nil {
+	if baseLogger == nil && tel != nil {
 		baseLogger = tel.Logger()
+	}
+	if baseLogger == nil {
+		baseLogger = observability.NopLogger()
+	}
+	metricsProvider := observability.NopMetrics()
+	if tel != nil {
+		metricsProvider = tel.Metrics()
 	}
 	return &Worker{
 		subscriber:   subscriber,
-		service:      service,
+		useCase:      useCase,
 		tel:          tel,
 		log:          baseLogger.With(observability.F("service", workerService)),
-		reqCounter:   tel.Counter("usecase_requests_total"),
-		durHistogram: tel.Histogram("usecase_duration_seconds"),
+		reqCounter:   metricsProvider.Counter(observability.MUsecaseRequests),
+		durHistogram: metricsProvider.Histogram(observability.MUsecaseDuration),
 	}
 }
 
 func (w *Worker) Start() {
-	if w.subscriber == nil || w.service == nil {
+	if w.subscriber == nil || w.useCase == nil {
 		return
 	}
 	w.subscriber.Subscribe(domorder.OrderCreatedEvent{}.EventName(), w.handleOrderCreated)
@@ -67,6 +75,7 @@ func (w *Worker) handleOrderCreated(ctx context.Context, e domoutbox.Event) erro
 	)
 	start := time.Now()
 	outcome, status := "success", "OK"
+	var failureReason string
 
 	logger := logctx.From(ctx)
 	if logger == nil {
@@ -75,6 +84,9 @@ func (w *Worker) handleOrderCreated(ctx context.Context, e domoutbox.Event) erro
 	logger = logger.With(
 		observability.F("use_case", useCase),
 		observability.F("event", e.EventName()),
+		observability.F("order_id", evt.OrderID),
+		observability.F("product_id", evt.ProductID),
+		observability.F("quantity", evt.Quantity),
 	)
 	if sc := trace.SpanContextFromContext(ctx); sc.IsValid() {
 		logger = logger.With(
@@ -93,8 +105,13 @@ func (w *Worker) handleOrderCreated(ctx context.Context, e domoutbox.Event) erro
 			observability.F("outcome", outcome),
 			observability.F("status", status),
 			observability.F("latency_seconds", lat),
+			observability.F("order_id", evt.OrderID),
+			observability.F("product_id", evt.ProductID),
+			observability.F("quantity", evt.Quantity),
 		}
-		fields = append(fields, observability.F("order_id", evt.OrderID))
+		if failureReason != "" {
+			fields = append(fields, observability.F("failure_reason", failureReason))
+		}
 
 		logger.Info("use_case_done", fields...)
 
@@ -106,9 +123,16 @@ func (w *Worker) handleOrderCreated(ctx context.Context, e domoutbox.Event) erro
 		span.End()
 	}()
 
-	if err := w.service.OnOrderCreated(ctx, evt); err != nil {
+	res, err := w.useCase.Execute(ctx, evt)
+	if err != nil {
 		outcome, status = "error", "STATE_TRANSITION_FAILED"
+		if res != nil {
+			failureReason = res.FailureReason
+		}
 		return fmt.Errorf("worker: inventory reservation transition: %w", err)
+	}
+	if res != nil && !res.Reserved && res.FailureReason != "" {
+		failureReason = res.FailureReason
 	}
 
 	return nil

@@ -3,8 +3,10 @@ package payment
 import (
 	"context"
 
+	"github.com/Zhima-Mochi/minishop-observability/app/internal/application"
 	domorder "github.com/Zhima-Mochi/minishop-observability/app/internal/domain/order"
 	domoutbox "github.com/Zhima-Mochi/minishop-observability/app/internal/domain/outbox"
+	pstat "github.com/Zhima-Mochi/minishop-observability/app/internal/domain/payment"
 	"github.com/Zhima-Mochi/minishop-observability/app/internal/observability"
 	"github.com/Zhima-Mochi/minishop-observability/app/internal/observability/logctx"
 )
@@ -13,8 +15,8 @@ const paymentWorker = "payment_worker"
 
 type Worker struct {
 	subscriber domoutbox.Subscriber
-	service    *Service
-	tel        observability.Telemetry
+	useCase    application.UseCase[ProcessPaymentInput, *ProcessPaymentResult]
+	tel        observability.Observability
 
 	log          observability.Logger
 	reqCounter   observability.Counter   // usecase_requests_total{use_case,outcome}
@@ -23,21 +25,28 @@ type Worker struct {
 
 func New(
 	subscriber domoutbox.Subscriber,
-	service *Service,
-	tel observability.Telemetry,
+	useCase application.UseCase[ProcessPaymentInput, *ProcessPaymentResult],
+	tel observability.Observability,
 ) *Worker {
+	baseLog := observability.NopLogger()
+	metricsProvider := observability.NopMetrics()
+	if tel != nil {
+		baseLog = tel.Logger()
+		metricsProvider = tel.Metrics()
+	}
+
 	return &Worker{
 		subscriber:   subscriber,
-		service:      service,
+		useCase:      useCase,
 		tel:          tel,
-		log:          tel.Logger(),
-		reqCounter:   tel.Counter("usecase_requests_total"),
-		durHistogram: tel.Histogram("usecase_duration_seconds"),
+		log:          baseLog,
+		reqCounter:   metricsProvider.Counter(observability.MUsecaseRequests),
+		durHistogram: metricsProvider.Histogram(observability.MUsecaseDuration),
 	}
 }
 
 func (w *Worker) Start() {
-	if w.subscriber == nil || w.service == nil {
+	if w.subscriber == nil || w.useCase == nil {
 		return
 	}
 	w.subscriber.Subscribe(domorder.OrderInventoryReservedEvent{}.EventName(), w.handleOrderInventoryReserved)
@@ -54,13 +63,18 @@ func (w *Worker) handleOrderInventoryReserved(ctx context.Context, e domoutbox.E
 		return nil
 	}
 
-	status, err := w.service.ProcessPayment(ctx, evt.OrderID, 0)
+	res, err := w.useCase.Execute(ctx, ProcessPaymentInput{OrderID: evt.OrderID, Amount: 0})
 	if err != nil {
 		logger.Warn("payment_processing_failed",
 			observability.F("order_id", evt.OrderID),
 			observability.F("error", err.Error()),
 		)
 		return err
+	}
+
+	status := pstat.StatusFailed
+	if res != nil {
+		status = res.Status
 	}
 
 	logger.Info("payment_processed",

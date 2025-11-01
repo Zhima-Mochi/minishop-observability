@@ -11,7 +11,7 @@ import (
 
 type tracer struct{ t trace.Tracer }
 
-func New(name string) observability.TraceCtx {
+func New(name string) observability.Tracer {
 	if name == "" {
 		name = "minishop"
 	}
